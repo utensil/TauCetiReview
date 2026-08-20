@@ -33,7 +33,13 @@ bill. See [REVIEWING.md](REVIEWING.md):
 uvx --from git+https://github.com/TauCetiProject/TauCetiReview tauceti-review 42
 uvx --from git+https://github.com/TauCetiProject/TauCetiReview tauceti-review 42 \
   --reviewer kiro --kiro-model gpt-5.6-sol
+uvx --from git+https://github.com/TauCetiProject/TauCetiReview tauceti-review 42 \
+  --reviewer codex --codex-model gpt-5.6-sol --codex-effort high
 ```
+
+An explicit Codex model pin disables automatic model fallback. An explicit
+effort is forwarded as `model_reasoning_effort` in every spawned Codex command
+and recorded in that attempt's archive provenance.
 
 ## Meta-review
 

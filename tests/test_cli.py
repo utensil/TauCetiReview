@@ -9,6 +9,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "runner"
 import cli  # noqa: E402
 
 
+def test_explicit_codex_profile_reaches_inner_engine():
+    assert cli.codex_review_args("gpt-5.6-sol", "high") == [
+        "--codex-model", "gpt-5.6-sol", "--codex-effort", "high"
+    ]
+    assert cli.codex_review_args("", "") == []
+
+
 def test_pr_ref_oids_uses_old_gh_compatible_rest_fields():
     calls = []
 

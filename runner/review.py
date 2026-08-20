@@ -309,6 +309,7 @@ class RunContext:
     spent_today: float
     pr_state: dict = field(default_factory=dict)  # PR-level publication write-ahead marker
     codex_model_explicit: bool = False   # --codex-model was passed → honor the pin, skip auto-fallback
+    codex_effort: str = ""               # explicit Codex reasoning effort, carried into the spawned argv
     ran: list = field(default_factory=list)
     run_results: list = field(default_factory=list)
     # Consecutive provider-down ATTEMPTS per provider, and the kind each was last down for. Keyed by
@@ -386,6 +387,8 @@ def run_rubric(ctx, rubric):
     def attempt():
         t = time.monotonic()
         env, rev_home = reviewer_env(provider, keys, subscription)
+        if provider == "codex" and ctx.codex_effort:
+            env["TAUCETI_INTERNAL_CODEX_REVIEW_EFFORT"] = ctx.codex_effort
         try:
             r = fn(prompt, a.tool_cwd, model, env)
         finally:
@@ -397,7 +400,7 @@ def run_rubric(ctx, rubric):
         # (TauCetiReview#105). It is a closed vocabulary, so unlike the stderr it derives from, it is
         # safe in a record that gets committed and pushed.
         attempts.append({k: r[k] for k in ("returncode", "cost_usd", "cost_estimated",
-                                           "usage", "session_id", "parse_error")
+                                           "usage", "session_id", "parse_error", "reasoning_effort")
                          if r.get(k) is not None}
                         | {"model": model, "secs": round(time.monotonic() - t, 1)}
                         | ({} if has_verdict(r) else {"error_kind": error_kind(r)}))
@@ -652,6 +655,11 @@ def main():
                     help=f"codex reviewer model (default: {CODEX_MODEL}). Passing this explicitly also "
                          "opts OUT of the automatic unavailable-model fallback — the pinned model is "
                          "used as chosen.")
+    ap.add_argument("--codex-effort", default=None,
+                    choices=["low", "medium", "high", "xhigh", "max", "ultra"],
+                    help="explicit Codex reviewer reasoning effort. When set, every spawned Codex "
+                         "command receives model_reasoning_effort in argv and records it in attempt "
+                         "provenance.")
     ap.add_argument("--kiro-model", default=KIRO_MODEL,
                     help=f"exact Kiro reviewer model (default: {KIRO_MODEL}); Kiro is explicit-only")
     ap.add_argument("--providers", default="claude,codex",
@@ -954,6 +962,9 @@ def main():
     if not providers:
         print(f"no usable providers in --providers={a.providers!r}", file=sys.stderr)
         sys.exit(1)
+    if a.codex_effort and "codex" not in providers:
+        print("--codex-effort requires codex in --providers", file=sys.stderr)
+        sys.exit(1)
     # Fail before spending if any provider we'll actually dispatch has an unpriced model. Include the
     # codex fallback (the seamless Sol->Terra downgrade in run_one can route to it) so an unpriced
     # fallback is caught here, not mid-round.
@@ -970,7 +981,8 @@ def main():
                      head=head, providers=providers, runners=runners, keys=keys,
                      subscription=subscription, rubrics_version=rubrics_version, round_num=round_num,
                      prov=prov, diff_full=diff_full, outdir=outdir, day=day, ledger=led,
-                     spent_today=spent_today, codex_model_explicit=a.codex_model is not None)
+                     spent_today=spent_today, codex_model_explicit=a.codex_model is not None,
+                     codex_effort=a.codex_effort)
 
     # Phase 1: the queued rubrics. Reserve before spending so a call can't breach the cap.
     # A `block` verdict halts the round: blocked code gets reworked or abandoned, and approvals

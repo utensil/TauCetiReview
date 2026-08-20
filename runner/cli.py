@@ -47,6 +47,12 @@ DEFAULT_ROADMAP_REPO = "TauCetiProject/TauCetiRoadmap"
 CACHE_DIR = pathlib.Path(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))) / "tauceti-review"
 
+
+def codex_review_args(model, effort):
+    """Explicit Codex profile flags forwarded to the inner review engine."""
+    return ((["--codex-model", model] if model else [])
+            + (["--codex-effort", effort] if effort else []))
+
 # A "review in progress" marker comment de-contends concurrent reviewers without any write access
 # beyond commenting: an independent reviewer may have repo write NOWHERE, but anyone who can review a
 # PR can comment on it. A reviewer posts the marker before spending inference and deletes it when done;
@@ -413,6 +419,13 @@ def main():
                          "kiro uses an exact --kiro-model and is explicit-only (never auto-drawn). "
                          "Default: every auto-drawn reviewer you "
                          "have available (claude, codex)")
+    ap.add_argument("--codex-model", default="",
+                    help="exact Codex reviewer model. Passing this pin disables the engine's "
+                         "automatic model fallback.")
+    ap.add_argument("--codex-effort", default="",
+                    choices=["", "low", "medium", "high", "xhigh", "max", "ultra"],
+                    help="explicit Codex reviewer reasoning effort, forwarded to every spawned "
+                         "Codex command.")
     ap.add_argument("--kiro-model", default="gpt-5.6-sol",
                     help="exact Kiro model (default: gpt-5.6-sol; e.g. claude-opus-5)")
     ap.add_argument("--no-mathlib", action="store_true",
@@ -558,6 +571,8 @@ def main():
                 "`kiro-cli` and, for --auth api, KIRO_API_KEY; a DeepSeek/MiniMax reviewer needs "
                 "`pi` on PATH + OPENROUTER_API_KEY).")
     providers = ",".join(avail)
+    if (a.codex_model or a.codex_effort) and "codex" not in avail:
+        die("--codex-model/--codex-effort require codex in the active reviewer set.")
     print(f"reviewers: {providers}", file=sys.stderr)
 
     repo_dir = engine_at(a.rubrics_sha) if a.rubrics_sha else resolve_repo_dir(a.repo_dir)
@@ -691,6 +706,7 @@ def main():
            *(["--submitted-by", a.submitted_by] if a.submitted_by else []),
            "--ci-build", ci_build or "", "--auth", a.auth,
            "--providers", providers, "--daily-budget", "1000000", "--no-post",
+           *codex_review_args(a.codex_model, a.codex_effort),
            "--kiro-model", a.kiro_model,
            "--max-rounds-per-day", str(a.max_rounds_per_day),
            "--scoreboard-file", str(work / "scoreboard.md"),
