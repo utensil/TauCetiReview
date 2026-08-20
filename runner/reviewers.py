@@ -463,7 +463,16 @@ def codex_model_unavailable(res):
     return bool(_CODEX_MODEL_MSG.search(hay))
 
 
+_CODEX_EFFORT_ENV = "TAUCETI_INTERNAL_CODEX_REVIEW_EFFORT"
+
+
 def run_codex(prompt, cwd, model, env):
+    # The public CLI threads an explicit review effort through a private
+    # runner-only environment slot. Remove it before spawning Codex so the
+    # authoritative control is visible in argv and cannot be inherited as
+    # ambient configuration by any tool the reviewer launches.
+    env = dict(env)
+    effort = env.pop(_CODEX_EFFORT_ENV, None)
     # Authenticate into this invocation's isolated CODEX_HOME so the credential is not shared.
     # In subscription mode there is no key (and no isolated home): use the inherited codex login.
     if env.get("OPENAI_API_KEY"):
@@ -473,9 +482,13 @@ def run_codex(prompt, cwd, model, env):
     # OS argument-size limit before codex starts.
     cmd = (["codex", "exec", "--json", "-s", "read-only", "--skip-git-repo-check",
             "-c", "shell_environment_policy.inherit=none"]
-           + (["-m", model] if model else []) + ["-"])
+           + (["-m", model] if model else [])
+           + (["-c", f'model_reasoning_effort="{effort}"'] if effort else [])
+           + ["-"])
     r = sh(cmd, cwd=cwd, env=env, stdin_text=prompt)
     out = {"returncode": r.returncode, "raw_stderr": r.stderr[-3000:]}
+    if effort:
+        out["reasoning_effort"] = effort
     text, usage, thread, events, errors = "", None, None, [], []
     fail_payload = err_payload = None  # turn.failed (authoritative) and first `error` event (fallback)
     for line in r.stdout.splitlines():
