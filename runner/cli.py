@@ -44,6 +44,9 @@ PROVIDER_DOWN_EXIT = 3
 REVIEW_REPO = "TauCetiProject/TauCetiReview"
 DEFAULT_CODE_REPO = "TauCetiProject/TauCeti"
 DEFAULT_ROADMAP_REPO = "TauCetiProject/TauCetiRoadmap"
+REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
+EXACT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 CACHE_DIR = pathlib.Path(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))) / "tauceti-review"
 
@@ -109,16 +112,35 @@ def stage_tree(src, dst, *, ignore_extra=()):
 
 def resolve_repo_dir(explicit):
     """Locate a TauCetiReview checkout providing rubrics/ and runner/ — engine and rubrics
-    together, so they never drift. Order: --repo-dir, $TAUCETI_REVIEW_DIR, this source tree if it
-    is a checkout, else a cached shallow clone refreshed each run."""
+    together, so they never drift. Order: --repo-dir, an exact configured engine repo/ref,
+    $TAUCETI_REVIEW_DIR, this source tree if it is a checkout, else a cached upstream clone
+    refreshed each run. The exact pair precedes the ambient checkout variable so a caller's pin
+    cannot be silently bypassed by inherited process state."""
     def ok(p):
         p = pathlib.Path(p)
         return (p / "rubrics").is_dir() and (p / "runner" / "review.py").is_file()
 
-    for cand in (explicit, os.environ.get("TAUCETI_REVIEW_DIR"),
-                 pathlib.Path(__file__).resolve().parent.parent):
-        if cand and ok(cand):
-            return pathlib.Path(cand).resolve()
+    if explicit and ok(explicit):
+        return pathlib.Path(explicit).resolve()
+
+    configured_repo = (os.environ.get("TAUCETI_REVIEW_ENGINE_REPO") or "").strip()
+    configured_ref = (os.environ.get("TAUCETI_REVIEW_ENGINE_REF") or "").strip()
+    if configured_repo or configured_ref:
+        if not configured_repo or not configured_ref:
+            die("TAUCETI_REVIEW_ENGINE_REPO and TAUCETI_REVIEW_ENGINE_REF must be set together")
+        if not REPO_SLUG_RE.fullmatch(configured_repo):
+            die(f"invalid TAUCETI_REVIEW_ENGINE_REPO: {configured_repo!r}")
+        if not EXACT_COMMIT_RE.fullmatch(configured_ref):
+            die("TAUCETI_REVIEW_ENGINE_REF must be an exact 40-hex commit id")
+        return engine_at(configured_ref.lower(), configured_repo)
+
+    env_checkout = os.environ.get("TAUCETI_REVIEW_DIR")
+    if env_checkout and ok(env_checkout):
+        return pathlib.Path(env_checkout).resolve()
+
+    source_tree = pathlib.Path(__file__).resolve().parent.parent
+    if ok(source_tree):
+        return source_tree
 
     clone = CACHE_DIR / "TauCetiReview"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -133,19 +155,28 @@ def resolve_repo_dir(explicit):
     return clone
 
 
-def engine_at(sha):
+def engine_at(sha, repo=REVIEW_REPO):
     """A cached checkout of TauCetiReview pinned at `sha` — rubrics AND engine together, so a
     shadow arm reruns exactly the code+rubrics of that commit, not main's engine on old rubrics."""
-    dst = CACHE_DIR / "engines" / sha[:12]
+    if not REPO_SLUG_RE.fullmatch(repo):
+        die(f"invalid review-engine repository: {repo!r}")
+    if not COMMIT_RE.fullmatch(sha):
+        die("review-engine commit must be 7–40 hexadecimal characters")
+    cache_repo = repo.replace("/", "__")
+    dst = CACHE_DIR / "engines" / cache_repo / sha.lower()
     if not (dst / "rubrics").is_dir():
         dst.mkdir(parents=True, exist_ok=True)
         run(["git", "init", "-q", str(dst)], quiet=True)
         run(["git", "-C", str(dst), "remote", "add", "origin",
-             f"https://github.com/{REVIEW_REPO}"], quiet=True, allow_fail=True)
+             f"https://github.com/{repo}"], quiet=True, allow_fail=True)
         run(["git", "-C", str(dst), "fetch", "-q", "--depth", "1", "origin", sha])
-        run(["git", "-C", str(dst), "checkout", "-q", sha])
+        run(["git", "-C", str(dst), "checkout", "-q", "--detach", "FETCH_HEAD"])
     if not ((dst / "rubrics").is_dir() and (dst / "runner" / "review.py").is_file()):
-        die(f"checkout of {REVIEW_REPO}@{sha[:12]} is missing rubrics/ or runner/review.py")
+        die(f"checkout of {repo}@{sha[:12]} is missing rubrics/ or runner/review.py")
+    head = run(["git", "-C", str(dst), "rev-parse", "HEAD"],
+               capture=True, quiet=True).stdout.strip().lower()
+    if not head.startswith(sha.lower()):
+        die(f"cached checkout of {repo}@{sha[:12]} resolved to unexpected commit {head[:12]}")
     return dst
 
 

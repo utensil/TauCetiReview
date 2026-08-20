@@ -49,7 +49,10 @@ uv run tauceti-review 42          # or: pipx install . / pip install .
 
 The rubrics and the review engine always come from a TauCetiReview checkout — the one you ran from
 if it is one, otherwise a cached shallow clone under `~/.cache/tauceti-review` that refreshes each
-run — so the rubrics never drift from the engine.
+run — so the rubrics never drift from the engine. An orchestrator can instead set
+`TAUCETI_REVIEW_ENGINE_REPO=owner/repository` together with
+`TAUCETI_REVIEW_ENGINE_REF=<40-hex commit>` to select an exact cached checkout. The pair is
+all-or-nothing and rejects branch names or abbreviated commits.
 
 ## Use
 
