@@ -12,6 +12,12 @@ credit is clearly absent.
   with no text copied.
 - Do not invent attribution requirements for routine work that draws on nothing in
   particular.
+- Roadmap attribution belongs in the PR description, as required by the documentation
+  rubric. A roadmap assigning a target or naming a prerequisite is not by itself a missing
+  code-level source citation. Keep credit for actual mathematical and formal sources in the
+  code; identify the specific borrowed argument or construction before treating a roadmap
+  blueprint as such a source. Do not request roadmap targets, paths, or coordination history
+  in a module docstring to satisfy attribution.
 
 ## Verdict
 
