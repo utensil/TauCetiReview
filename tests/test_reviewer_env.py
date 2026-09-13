@@ -6,6 +6,7 @@ import pathlib
 import sys
 import tempfile
 import sqlite3
+from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "runner"))
 import reviewers  # noqa: E402
@@ -50,6 +51,73 @@ def test_logname_is_a_user_fallback():
     assert env["USER"] == "fallback-user"
     assert env["LOGNAME"] == "fallback-user"
     reviewers.cleanup_rev_home(isolated_home)
+
+
+def _check_codex_subscription_home(setting, with_auth=True):
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory)
+        default_home = root / ".codex"
+        selected_home = root / "selected profile"
+        for source in (default_home, selected_home):
+            source.mkdir()
+            (source / "auth.json").write_text(source.name)
+            (source / "config.toml").write_text("personal config")
+            (source / "AGENTS.md").write_text("personal instructions")
+        source_home = selected_home if setting else default_home
+        if not with_auth:
+            (source_home / "auth.json").unlink()
+        environment = {"HOME": str(root), "PATH": "/usr/bin"}
+        if setting is not None:
+            environment["CODEX_HOME"] = str(selected_home) if setting else ""
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            reviewers, "REV_HOME_BASE", str(root / "reviewer-homes")
+        ):
+            env, isolated_home = reviewers.reviewer_env("codex", {}, subscription=True)
+            try:
+                isolated_codex = pathlib.Path(isolated_home) / ".codex"
+                assert env["HOME"] == isolated_home
+                if with_auth:
+                    assert env["CODEX_HOME"] == str(isolated_codex)
+                    assert (isolated_codex / "auth.json").read_text() == source_home.name
+                    assert {path.name for path in isolated_codex.iterdir()} == {"auth.json"}
+                    (isolated_codex / "auth.json").write_text("changed copy")
+                    assert (source_home / "auth.json").read_text() == source_home.name
+                else:
+                    assert env["CODEX_HOME"] == str(source_home)
+                    assert not (isolated_codex / "auth.json").exists()
+                    assert (default_home / "auth.json").read_text() == default_home.name
+            finally:
+                reviewers.cleanup_rev_home(isolated_home)
+
+
+def test_codex_subscription_honors_selected_home():
+    _check_codex_subscription_home("selected")
+
+
+def test_codex_subscription_uses_default_when_home_unset():
+    _check_codex_subscription_home(None)
+
+
+def test_codex_subscription_uses_default_when_home_empty():
+    _check_codex_subscription_home("")
+
+
+def test_codex_missing_selected_auth_does_not_use_default_account():
+    _check_codex_subscription_home("selected", with_auth=False)
+
+
+def test_codex_api_key_keeps_isolated_home():
+    with tempfile.TemporaryDirectory() as directory:
+        with patch.dict(os.environ, {"CODEX_HOME": directory}), patch.object(
+            reviewers, "REV_HOME_BASE", str(pathlib.Path(directory) / "reviewer-homes")
+        ):
+            env, isolated_home = reviewers.reviewer_env("codex", {"openai": "test-key"})
+            try:
+                assert env["CODEX_HOME"] == str(pathlib.Path(isolated_home) / ".codex")
+                assert env["OPENAI_API_KEY"] == "test-key"
+                assert not (pathlib.Path(env["CODEX_HOME"]) / "auth.json").exists()
+            finally:
+                reviewers.cleanup_rev_home(isolated_home)
 
 
 def test_kiro_subscription_copies_only_login_store():
