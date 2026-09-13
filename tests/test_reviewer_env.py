@@ -6,6 +6,7 @@ import pathlib
 import sys
 import tempfile
 import sqlite3
+import subprocess
 from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "runner"))
@@ -104,6 +105,36 @@ def test_codex_subscription_uses_default_when_home_empty():
 
 def test_codex_missing_selected_auth_does_not_use_default_account():
     _check_codex_subscription_home("selected", with_auth=False)
+
+
+def test_codex_relative_home_fallback_keeps_parent_directory():
+    original_directory = os.getcwd()
+    with tempfile.TemporaryDirectory() as directory:
+        root = pathlib.Path(directory).resolve()
+        launch_directory = root / "launch"
+        review_directory = root / "review"
+        selected_home = launch_directory / "selected"
+        decoy_home = review_directory / "selected"
+        selected_home.mkdir(parents=True)
+        decoy_home.mkdir(parents=True)
+        (selected_home / "config.toml").write_text("selected config")
+        (decoy_home / "config.toml").write_text("wrong config")
+        isolated_home = None
+        with patch.dict(os.environ, {"HOME": str(root), "CODEX_HOME": "selected"}, clear=True), patch.object(
+            reviewers, "REV_HOME_BASE", str(root / "reviewer-homes")
+        ):
+            try:
+                os.chdir(launch_directory)
+                env, isolated_home = reviewers.reviewer_env("codex", {}, subscription=True)
+                result = subprocess.run(
+                    [sys.executable, "-c", "import os,pathlib; print((pathlib.Path(os.environ['CODEX_HOME']) / 'config.toml').read_text())"],
+                    cwd=review_directory, env=env, capture_output=True, text=True, check=True,
+                )
+                assert result.stdout.strip() == "selected config"
+                assert env["CODEX_HOME"] == str(selected_home)
+            finally:
+                os.chdir(original_directory)
+                reviewers.cleanup_rev_home(isolated_home)
 
 
 def test_codex_api_key_keeps_isolated_home():

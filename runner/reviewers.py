@@ -192,7 +192,7 @@ def reviewer_env(provider, keys, subscription=False):
         env["CODEX_HOME"] = codex_home
         if subscription:
             # Seed only the ChatGPT login; no personal AGENTS.md / config.toml.
-            source_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+            source_home = os.path.abspath(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
             src = os.path.join(source_home, "auth.json")
             if os.path.exists(src):
                 shutil.copyfile(src, os.path.join(codex_home, "auth.json"))
