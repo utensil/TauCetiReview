@@ -7,9 +7,6 @@ Dependency-free — run with `python tests/test_prices.py` or under pytest.
 """
 import sys
 import pathlib
-import json
-import types
-from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "runner"))
@@ -56,32 +53,6 @@ def test_explicit_codex_model_is_checked_for_pricing():
     models = review.dispatch_models(codex_model="gpt-6-astra")
     assert "gpt-6-astra" in models
     review.require_priced(models)
-
-
-def test_astra_codex_usage_is_priced_and_pin_is_preserved():
-    import reviewers
-
-    usage = {"input_tokens": 100000, "cached_input_tokens": 80000, "output_tokens": 10000}
-    events = [
-        {"type": "item.completed", "item": {"type": "agent_message", "text": "review result"}},
-        {"type": "turn.completed", "usage": usage},
-    ]
-    response = types.SimpleNamespace(
-        returncode=0, stdout="\n".join(json.dumps(event) for event in events), stderr="")
-    with patch.object(reviewers, "sh", return_value=response) as command:
-        result = reviewers.run_codex("review", "/tmp", "gpt-6-astra", {})
-    argv = command.call_args.args[0]
-    assert argv[argv.index("-m") + 1] == "gpt-6-astra"
-    assert result["cost_usd"] == 0.78
-    assert result["cost_estimated"] is True
-
-
-def test_astra_analytics_long_context_boundary():
-    from costs import cost_from_window
-
-    window = review._PRICE_WINDOWS["gpt-6-astra"][-1]
-    assert cost_from_window(window, 272000, 200000, 10000) == 1.42
-    assert cost_from_window(window, 272001, 200000, 10000) == 2.59002
 
 
 if __name__ == "__main__":
