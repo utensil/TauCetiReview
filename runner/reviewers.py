@@ -192,11 +192,12 @@ def reviewer_env(provider, keys, subscription=False):
         env["CODEX_HOME"] = codex_home
         if subscription:
             # Seed only the ChatGPT login; no personal AGENTS.md / config.toml.
-            src = os.path.expanduser("~/.codex/auth.json")
+            source_home = os.path.abspath(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
+            src = os.path.join(source_home, "auth.json")
             if os.path.exists(src):
                 shutil.copyfile(src, os.path.join(codex_home, "auth.json"))
             else:
-                env["CODEX_HOME"] = os.path.expanduser("~/.codex")  # fallback; less reproducible
+                env["CODEX_HOME"] = source_home  # fallback; less reproducible
         else:
             env["OPENAI_API_KEY"] = keys["openai"]
     # Return the throwaway dir alongside env so the caller cleans it up even in the fallback paths

@@ -57,6 +57,14 @@ all-or-nothing and rejects branch names or abbreviated commits.
 
 ## Use
 
+For Codex subscription reviews, set `CODEX_HOME` to select a separate login
+profile. The engine copies only that directory's `auth.json` into the reviewer's
+temporary home, without importing personal settings or instructions. Unset or
+empty `CODEX_HOME` uses `~/.codex`. Relative paths resolve from the engine's
+working directory, not the review checkout. If the selected directory has no `auth.json`,
+the existing authentication fallback uses that same directory, not another
+profile; this fallback does not provide the clean-room configuration isolation.
+
 ```bash
 tauceti-review 42                       # review PR #42, PRINT the verdicts — posts nothing
 tauceti-review 42 --post                # also post the scoreboard + threads, as you
