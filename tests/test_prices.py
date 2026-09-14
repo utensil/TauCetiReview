@@ -8,6 +8,7 @@ Dependency-free — run with `python tests/test_prices.py` or under pytest.
 import sys
 import pathlib
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "runner"))
 import review  # noqa: E402  (runner/ on path; same import the engine uses)
 
@@ -46,6 +47,12 @@ def test_require_priced_rejects_unknown_model():
     except SystemExit:
         return
     raise AssertionError("require_priced() should SystemExit on an unpriced model")
+
+
+def test_explicit_codex_model_is_checked_for_pricing():
+    models = review.dispatch_models(codex_model="gpt-6-astra")
+    assert "gpt-6-astra" in models
+    review.require_priced(models)
 
 
 if __name__ == "__main__":
