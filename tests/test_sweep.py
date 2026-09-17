@@ -270,7 +270,7 @@ def test_workflows_pass_status_contexts():
     assert 'already in the queue' in merge_only
     merge_sweep = (root / ".github/workflows/merge-sweep.yml").read_text()
     assert 'ref: ${{ inputs.review_ref }}' in merge_sweep
-    assert '"headRefOid,baseRefName,id,labels,statusCheckRollup"' in sweep_source
+    assert '"headRefOid,baseRefName,id,labels,statusCheckRollup,isCrossRepository"' in sweep_source
     assert 'MERGE_PREFIX, scope=scope' in sweep_source
 
 
@@ -362,6 +362,159 @@ def test_count_evictions_ignores_our_own_reservation_removals():
     assert sweep.count_evictions(events, cutoff, app_login="tauceti-review-bot") == 1
     assert sweep.is_reservation_removal("Tauceti-Review-Bot", "tauceti-review-bot")
     assert not sweep.is_reservation_removal(None, "tauceti-review-bot")
+
+
+def _request(head, author="tauceti-review-bot[bot]"):
+    return {"author": author, "body": f"Merge-queue recovery for head `{head[:7]}`.\n\n<!--tauceti-rebase:v1 {head}-->"}
+
+
+def test_handoff_trust_and_head_binding():
+    head = "a" * 40
+    assert sweep.rebase_request_heads([_request(head)]) == {head}
+    assert sweep.rebase_request_heads([_request(head, "contributor"), _request("bad")]) == set()
+
+
+def test_fork_handoff_retries_label_without_reposting_and_stops_at_head():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    head = "a" * 40
+    comments, calls = [], []
+    label_fails = True
+
+    def gh(args):
+        calls.append(args)
+        if args[:2] == ["pr", "comment"]:
+            comments.append({"author": "tauceti-review-bot[bot]", "body": args[-1]})
+        fail = label_fails and args[:2] == ["pr", "edit"]
+        return SimpleNamespace(returncode=int(fail), stdout="", stderr="label error" if fail else "")
+
+    with patch.object(sweep, "DRY_RUN", False), patch.object(sweep, "gh", gh), \
+            patch.object(sweep, "update_branch", side_effect=AssertionError("fork update attempted")):
+        assert not sweep.recover_branch(1, head, True, comments)
+        assert len(comments) == 1
+        label_fails = False
+        assert sweep.reconcile_rebase_request(1, head, [], comments) == "waiting"
+        assert len(comments) == 1
+        calls.clear()
+        assert sweep.reconcile_rebase_request(1, head, [{"name": "needs-rebase"}], comments) == "waiting"
+        assert calls == []
+
+
+def test_handoff_new_head_cleanup_and_races():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    old, head = "a" * 40, "b" * 40
+    labels = [{"name": "needs-rebase"}]
+    with patch.object(sweep, "DRY_RUN", False), patch.object(sweep, "current_head", return_value=head) as current, \
+            patch.object(sweep, "gh", return_value=SimpleNamespace(returncode=0)) as gh:
+        assert sweep.reconcile_rebase_request(1, head, labels, []) == "ready"
+        gh.assert_not_called()  # preserve a human/legacy label
+        assert sweep.reconcile_rebase_request(1, head, labels, [_request(old)]) == "ready"
+        assert "--remove-label" in gh.call_args.args[0]
+        gh.reset_mock()
+        current.return_value = "c" * 40
+        assert sweep.reconcile_rebase_request(1, head, labels, [_request(old)]) == "waiting"
+        gh.assert_not_called()
+        with patch.object(sweep, "DRY_RUN", True):
+            assert sweep.reconcile_rebase_request(1, head, labels, [_request(old)]) == "ready"
+            assert sweep.recover_branch(1, head, True, [])
+            gh.assert_not_called()
+
+
+def test_main_hands_off_once_then_waits_until_push():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    head = "a" * 40
+    labels, comments, mutations = [], [], []
+    view = {"headRefOid": head, "baseRefName": "main", "id": "PR_1", "labels": labels,
+            "statusCheckRollup": [], "isCrossRepository": True}
+
+    def gh_json(args):
+        if args[:2] == ["pr", "list"]:
+            return [{"number": 1, "isDraft": False, "labels": labels}]
+        if args[:2] == ["pr", "view"]:
+            return view
+        if "/compare/" in args[1]:
+            return {"behind_by": 10}
+        if "/commits/" in args[1]:
+            return {"commit": {"committer": {"date": "2026-09-01T00:00:00Z"}}}
+        raise AssertionError(args)
+
+    def gh_jsonl(args):
+        if "/comments?" in args[2]:
+            return comments
+        return [{"event": "removed_from_merge_queue", "created_at": "2026-09-02T00:00:00Z"}] * 2
+
+    def gh(args):
+        if args[:2] == ["pr", "diff"]:
+            return SimpleNamespace(returncode=0, stdout="diff", stderr="")
+        mutations.append(args[:2])
+        if args[:2] == ["pr", "comment"]:
+            comments.append({"author": "tauceti-review-bot[bot]", "body": args[-1]})
+        elif "--add-label" in args:
+            labels.append({"name": "needs-rebase"})
+        elif "--remove-label" in args:
+            labels.clear()
+        else:
+            raise AssertionError(args)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with patch.object(sweep, "REPO", "owner/repo"), patch.object(sweep, "DRY_RUN", False), \
+            patch.object(sweep, "queue_entries", return_value=[]), \
+            patch.object(sweep, "gh_json", gh_json), patch.object(sweep, "gh_jsonl", gh_jsonl), \
+            patch.object(sweep, "gh", gh), \
+            patch.object(sweep, "decide_from_comments", return_value={"merge": True}) as gate:
+        assert sweep.main() == 0
+        assert mutations == [["pr", "comment"], ["pr", "edit"]]
+        assert len(comments) == 1
+        mutations.clear()
+        gate.reset_mock()
+        assert sweep.main() == 0
+        assert mutations == []
+        gate.assert_not_called()  # do not retry the same green, evicted head
+        view["headRefOid"] = "b" * 40
+        gate.return_value = {"merge": False}  # new head is awaiting CI/review
+        assert sweep.main() == 0
+        assert not labels
+        assert mutations == [["pr", "edit"]]
+        gate.assert_called_once()
+
+
+def test_up_to_date_eviction_waits_for_human_without_worker_request():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    head, comments = "a" * 40, []
+
+    def gh(args):
+        if args[:2] == ["pr", "comment"]:
+            comments.append({"author": "tauceti-review-bot[bot]", "body": args[-1]})
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with patch.object(sweep, "DRY_RUN", False), patch.object(sweep, "gh", gh):
+        assert sweep.flag(1, head, comments, worker=False)
+        assert not sweep.rebase_request_heads(comments)
+        assert sweep.rebase_request_heads(comments, stalled=True) == {head}
+        assert sweep.reconcile_rebase_request(1, head, [], comments) == "waiting"
+        assert len(comments) == 1
+        assert not sweep.rebase_request_heads(comments)  # label repair must not upgrade to worker work
+
+
+def test_same_repo_updates_keep_real_errors_visible():
+    from unittest.mock import patch
+    with patch.object(sweep, "update_branch", return_value="updated") as update, \
+            patch.object(sweep, "flag", return_value=True) as flag:
+        assert sweep.recover_branch(1, "a" * 40, False, [])
+        update.assert_called_once()
+        flag.assert_not_called()
+        update.return_value = "error"
+        assert not sweep.recover_branch(1, "a" * 40, False, [])
+        flag.assert_not_called()
+        update.return_value = "conflict"
+        assert sweep.recover_branch(1, "a" * 40, False, [])
+        flag.assert_called_once()
+        update.reset_mock()
+        assert not sweep.recover_branch(1, "a" * 40, None, [])
+        update.assert_not_called()
 
 
 def run():
