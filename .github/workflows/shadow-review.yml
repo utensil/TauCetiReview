@@ -132,7 +132,7 @@ jobs:
       - name: Mint archive token (TauCetiData contents:write)
         id: archive_token
         if: always()
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2.2.1; v1 ignores permission-* inputs
         with:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
