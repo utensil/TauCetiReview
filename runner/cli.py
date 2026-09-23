@@ -188,6 +188,31 @@ def gh_json(repo, pr, fields):
     return json.loads(r.stdout)
 
 
+def ci_build_status(meta, head):
+    """Assert a green build only for the reviewed head, across both GitHub status formats.
+
+    TauCeti's workflow-pinned audit posts a StatusContext, whereas older builds used a
+    CheckRun. A pending or conflicting build entry must not become a trusted success.
+    """
+    if meta.get("headRefOid") != head:
+        return ""
+    statuses = []
+    for c in (meta.get("statusCheckRollup") or []):
+        # Discriminate on `__typename`, the way review.yml and sweep.status_states do, so the
+        # two vocabularies never cross-read. Older `gh` that omits it falls back to the field
+        # shape; the two node types carry disjoint keys, so that stays unambiguous.
+        kind = c.get("__typename")
+        if kind == "StatusContext":
+            if c.get("context") == "build":
+                statuses.append((c.get("state") or "").lower())
+        elif kind == "CheckRun":
+            if c.get("name") == "build":
+                statuses.append((c.get("conclusion") or "").lower())
+        elif (c.get("name") or c.get("context")) == "build":
+            statuses.append((c.get("conclusion") or c.get("state") or "").lower())
+    return "success" if statuses and all(s == "success" for s in statuses) else ""
+
+
 def pr_ref_oids(repo, pr):
     """Return the PR's head and base tips without requiring newer `gh pr view` JSON fields.
 
@@ -337,7 +362,7 @@ def post_marker(repo, pr, head, providers, nonce, submitted_by):
 def delete_marker(repo, comment_id):
     """Remove a marker by id. Best-effort (a 404 — already gone or expired-and-gc'd — is fine)."""
     run(["gh", "api", "-X", "DELETE", f"/repos/{repo}/issues/comments/{comment_id}"],
-        quiet=True, allow_fail=True)
+        quiet=True, capture=True, allow_fail=True)
 
 
 # Markers this process owns and must remove on exit. atexit alone misses signals, so SIGTERM/SIGINT are
@@ -470,6 +495,10 @@ def main():
                     choices=["", "low", "medium", "high", "xhigh", "max", "ultra"],
                     help="explicit Codex reviewer reasoning effort, forwarded to every spawned "
                          "Codex command.")
+    ap.add_argument("--claude-model", default=os.environ.get("TAUCETI_CLAUDE_MODEL") or None,
+                    help="exact direct-Claude model; overrides TAUCETI_CLAUDE_MODEL. "
+                         "Unset: keep the selected engine's default. Model must be priced in "
+                         "runner/prices.json (e.g. claude-fable-5-1)")
     ap.add_argument("--kiro-model", default="gpt-5.6-sol",
                     help="exact Kiro model (default: gpt-5.6-sol; e.g. claude-opus-5)")
     ap.add_argument("--no-mathlib", action="store_true",
@@ -538,6 +567,11 @@ def main():
     a.kiro_model = (a.kiro_model or "").strip()
     if not a.kiro_model or a.kiro_model.lower().startswith("auto"):
         die(f"--kiro-model needs an exact model id, not Kiro Auto: {a.kiro_model!r}")
+
+    # A whitespace-only TAUCETI_CLAUDE_MODEL is easy to produce from a CI variable and is
+    # truthy, so normalise here rather than letting it reach the engine and fail as an
+    # unpriced model only after workspace setup and the Mathlib fetch.
+    a.claude_model = (a.claude_model or "").strip() or None
 
     # --sync-only: no review, just drain an existing store's outbox into TauCetiData and exit. The
     # host runs this after a --no-sync review (e.g. a bubble) to publish with its own creds. Loud:
@@ -661,8 +695,8 @@ def main():
     # just leaves it blank, and the engine then injects nothing).
     ci_build = ""
     try:
-        rollup = gh_json(a.repo, a.pr, "statusCheckRollup").get("statusCheckRollup") or []
-        ci_build = next((c.get("conclusion", "") for c in rollup if c.get("name") == "build"), "")
+        build_meta = gh_json(a.repo, a.pr, "headRefOid,statusCheckRollup")
+        ci_build = ci_build_status(build_meta, head)
     except Exception:
         ci_build = ""
     meta = gh_json(a.repo, a.pr, "title,body")
@@ -762,6 +796,8 @@ def main():
            "--scoreboard-file", str(work / "scoreboard.md"),
            "--threads-dir", str(work / "threads"), "--post-plan-file", str(plan),
            "--replies-json", str(replies_path)]
+    if a.claude_model:
+        cmd += ["--claude-model", a.claude_model]
     if a.rubrics:
         cmd += ["--rubrics", a.rubrics]
     print("\n=== running review (this calls claude/codex per rubric; takes a few minutes) ===\n",

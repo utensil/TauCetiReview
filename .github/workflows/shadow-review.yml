@@ -59,7 +59,7 @@ jobs:
           echo "MERGE_BASE=$MERGE_BASE" >> "$GITHUB_ENV"
           echo "RUBRICS_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           CI_BUILD=$(gh pr view "$PR" --repo TauCetiProject/TauCeti --json statusCheckRollup \
-            -q '[.statusCheckRollup[]? | select(.name=="build") | .conclusion] | first // ""')
+            -q '[.statusCheckRollup[]? | select(.__typename=="StatusContext" and .context=="build") | .state] | first // ""')
           echo "CI_BUILD=$CI_BUILD" >> "$GITHUB_ENV"
           gh pr diff "$PR" --repo TauCetiProject/TauCeti > diff.txt
           gh pr view "$PR" --repo TauCetiProject/TauCeti --json title,body \
