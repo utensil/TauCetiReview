@@ -114,8 +114,7 @@ def _git(d, args, env, timeout, sink=None, limit=MAX_BYTES, stdin=b"", disk_cap=
         lock = threading.Lock()
 
         def kill(reason):
-            # Only while git is unreaped (`done` is set before the reaping wait), so a recycled PID
-            # is never signalled.
+            # Reaping and setting `done` share this lock, so a recycled PID is never signalled.
             with lock:
                 if not done.is_set():
                     reason.set()
@@ -145,9 +144,15 @@ def _git(d, args, env, timeout, sink=None, limit=MAX_BYTES, stdin=b"", disk_cap=
                     out.append(chunk)
                 else:
                     sink.write(chunk)
-            # Wait for git to exit WITHOUT reaping it, so the timer and the watcher can still
-            # kill it safely until `done` is set below.
-            os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOWAIT)
+            # Some supported Python builds (including macOS 3.12) have no os.waitid.
+            # Reap under the same lock as kill(), disabling watchdogs before releasing it.
+            # Keep the wait bounded even if git closes stdout before it exits.
+            while True:
+                with lock:
+                    if p.poll() is not None:
+                        done.set()
+                        break
+                done.wait(0.01)
         except BaseException:
             kill(threading.Event())
             raise
