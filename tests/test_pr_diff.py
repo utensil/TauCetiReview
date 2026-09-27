@@ -177,6 +177,34 @@ def test_timeout_kills_git_and_its_children():
         assert time.monotonic() - t0 < 10
 
 
+def test_git_runs_without_waitid():
+    # macOS Python 3.12 has no os.waitid. Exercise that platform contract on Linux too.
+    with tempfile.TemporaryDirectory() as d, patch.dict(os.__dict__):
+        os.__dict__.pop("waitid", None)
+        assert pr_diff._git(d, ["init", "-q", "--bare"], pr_diff._git_env(), 5) == b""
+
+
+def test_timeout_still_applies_after_stdout_closes():
+    # EOF does not imply exit: git and its alias can both close stdout, then hang.
+    popen = subprocess.Popen
+
+    def closed_stdout(*args, **kwargs):
+        kwargs["stdout"] = subprocess.DEVNULL
+        p = popen(*args, **kwargs)
+        p.stdout = io.BytesIO()
+        return p
+
+    with tempfile.TemporaryDirectory() as d, patch.object(subprocess, "Popen", closed_stdout):
+        t0 = time.monotonic()
+        try:
+            pr_diff._git(d, ["-c", "alias.slow=!sleep 30", "slow"], pr_diff._git_env(), 0.5)
+        except RuntimeError as e:
+            assert "timed out" in str(e), e
+        else:
+            raise AssertionError("no timeout after stdout closed")
+        assert time.monotonic() - t0 < 10
+
+
 
 def test_disk_cap_kills_git_while_it_is_still_running():
     # git (here a stand-in that writes 3 MB into the repository, then idles) is killed as soon as
