@@ -20,6 +20,13 @@ def test_every_dispatchable_model_is_priced():
         f"Add them to runner/prices.json (priced: {sorted(review.PRICES)})")
 
 
+def test_explicit_codex_model_is_priced():
+    missing = sorted(
+        m for m in review.dispatch_models(codex_model="gpt-6.1-sol") if m not in review.PRICES
+    )
+    assert not missing, f"explicit gpt-6.1-sol review model is unpriced: {missing}"
+
+
 def test_price_windows_are_well_formed():
     bad = []
     for model, windows in review._PRICE_WINDOWS.items():

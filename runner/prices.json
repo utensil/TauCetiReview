@@ -10,6 +10,8 @@
     "claude-haiku-4-5":         [{"effective": "2026-01-01", "input": 1.0,  "output": 5.0,  "cache_read": 0.1}],
     "gpt-6-astra":              [{"effective": "2026-09-14", "input": 10.0, "output": 50.0, "cache_read": 1.0,
                                   "long_context": {"threshold": 272000, "input": 20.0, "output": 75.0, "cache_read": 2.0}}],
+    "gpt-6.1-sol":              [{"effective": "2026-09-29", "input": 2.0, "output": 10.0, "cache_read": 0.1,
+                                  "long_context": {"threshold": 272000, "input": 4.0, "output": 15.0, "cache_read": 0.2}}],
     "gpt-5.5":                  [{"effective": "2026-01-01", "input": 5.0,  "output": 30.0, "cache_read": 0.5,
                                   "long_context": {"threshold": 272000, "input": 10.0, "output": 45.0, "cache_read": 1.0}}],
     "gpt-5.6-sol":              [{"effective": "2026-07-09", "input": 5.0,  "output": 30.0, "cache_read": 0.5,
