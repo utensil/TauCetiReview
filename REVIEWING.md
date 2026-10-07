@@ -47,8 +47,9 @@ needs a `git+https` install or a git checkout (where uncommitted changes to trac
 
 Before each review the CLI compares the rubrics it will use with upstream's published `main`,
 except for exact content pins approved by this fork's rubric policy below. Unexpected differences
-(a stale checkout, an older pin, or local edits) produce a warning on the scoreboard and review
-threads. Approved fork pins are disclosed separately, with a link to the merged policy.
+(a stale checkout, an older pin, or local edits) produce a CLI warning. Public review comments
+keep the existing rubric commit-hash links without additional policy notes or drift warnings.
+The policy and drift status remain in machine-readable metadata and archives.
 
 ### Approved fork rubric differences
 

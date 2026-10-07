@@ -367,42 +367,6 @@ def rubrics_publication(rubrics_dir, sha, targets=None):
     return drift, published
 
 
-# Duplicated from render.DRIFT_WARNING for the same reason as PROVIDER_DOWN_EXIT; tests/test_cli.py
-# pins the two together.
-DRIFT_WARNING = ("⚠️ This review ran from a rubrics checkout that differs from the expected "
-                 "published versions (upstream main plus any explicitly pinned fork rubrics), "
-                 "so its findings may reflect unapproved or outdated rules.")
-
-
-def ensure_drift_warning(scoreboard):
-    """Put DRIFT_WARNING on a scoreboard an engine wrote without it: an engine predating the
-    TAUCETI_RUBRICS_DRIFT flag (a stale --repo-dir is exactly the case being flagged) ignores it.
-    Inserted above the rubric table, or after the heading if there is none."""
-    ensure_scoreboard_note(scoreboard, DRIFT_WARNING)
-
-
-def ensure_scoreboard_note(scoreboard, note):
-    path = pathlib.Path(scoreboard)
-    lines = path.read_text().split("\n")
-    if any(note in line for line in lines):
-        return
-    at = next((i for i, line in enumerate(lines) if line.startswith("| |")), None)
-    if at is None:
-        at = next((i + 1 for i, line in enumerate(lines) if line.startswith("## ")), 0)
-    lines[at:at] = [f"> {note}", ""]
-    path.write_text("\n".join(lines))
-
-
-def ensure_rubric_policy_note(scoreboard, policy):
-    """Older pinned engines cannot render the new provenance; keep their scoreboard transparent."""
-    if not policy or not policy.get("targets"):
-        return
-    url = f"https://github.com/{policy['repo']}/blob/{policy['sha']}/{RUBRIC_POLICY_FILE}"
-    if url not in pathlib.Path(scoreboard).read_text():
-        ensure_scoreboard_note(scoreboard, f"Fork rubric policy: [explicit content pins]({url}); "
-                               "all other rubrics track upstream main.")
-
-
 def tristate(flag):
     """True/False/None as the "1"/"0"/"" environment encoding the engine reads back."""
     return "" if flag is None else "1" if flag else "0"
@@ -1029,8 +993,7 @@ def main():
                                           (policy or {}).get("targets"))
     if drift:
         print(f"tauceti-review: WARNING: the rubrics in {repo_dir} differ from {REVIEW_REPO}'s "
-              "published main plus the verified fork pins. This review applies them anyway and "
-              "the scoreboard will say so; "
+              "published main plus the verified fork pins. This review applies them anyway; "
               "update the checkout unless you are testing a rubric change.", file=sys.stderr)
     if published is False:
         print(f"tauceti-review: WARNING: rubrics commit {rub_sha[:12]} is not on GitHub, so PR "
@@ -1089,9 +1052,6 @@ def main():
     sb = (work / "scoreboard.md")
     if not sb.is_file():
         die(f"review step exited cleanly but produced no scoreboard ({sb}); the engine did not run.")
-    if drift:
-        ensure_drift_warning(sb)
-    ensure_rubric_policy_note(sb, policy)
     print("\n" + "=" * 72)
     print(sb.read_text())
     threads = sorted((work / "threads").glob("*.md")) if (work / "threads").is_dir() else []

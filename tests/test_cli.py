@@ -542,40 +542,6 @@ def test_other_422s_leave_publication_unknown():
     assert _publication(tree, spam, {"a.md": "alpha\n"}) == (False, None)
 
 
-def test_drift_warning_matches_engine_and_is_added_once():
-    import render
-    assert cli.DRIFT_WARNING == render.DRIFT_WARNING
-    with tempfile.TemporaryDirectory() as d:
-        sb = pathlib.Path(d) / "scoreboard.md"
-        sb.write_text("<!--tauceti-scoreboard-->\n## AI review\n\nintro\n\n| | rubric |\n|---|---|\n")
-        cli.ensure_drift_warning(sb)
-        text = sb.read_text()
-        assert text.index(cli.DRIFT_WARNING) < text.index("| | rubric |")
-        cli.ensure_drift_warning(sb)  # an engine that already rendered it is left alone
-        assert sb.read_text().count(cli.DRIFT_WARNING) == 1
-        sb.write_text("## AI review\nno table\n")
-        cli.ensure_drift_warning(sb)
-        assert sb.read_text().split("\n")[1] == f"> {cli.DRIFT_WARNING}"
-
-
-def test_older_pinned_engine_still_discloses_approved_fork_pins():
-    import render
-    policy = {"repo": "utensil/TauCetiReview", "sha": "b" * 40,
-              "targets": {"rubrics/reuse.md": "c" * 40}}
-    with tempfile.TemporaryDirectory() as d:
-        sb = pathlib.Path(d) / "scoreboard.md"
-        sb.write_text("## AI review\n\n| | rubric |\n|---|---|\n")
-        cli.ensure_rubric_policy_note(sb, policy)
-        cli.ensure_rubric_policy_note(sb, policy)
-        assert sb.read_text().count("rubric-deviations.json") == 1
-        assert sb.read_text().index("Fork rubric policy") < sb.read_text().index("| | rubric |")
-        current = render.render_scoreboard([], {}, "a" * 40, "approved", "",
-                                          prov={"rubrics_policy": policy})
-        sb.write_text(current)
-        cli.ensure_rubric_policy_note(sb, policy)
-        assert sb.read_text() == current
-
-
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for test in tests:
