@@ -512,6 +512,17 @@ def test_reservation_holder_respects_the_budget():
     assert sweep.reservation_holder(entries, _T0, exhausted=(30,)) is None
 
 
+def test_queue_entries_reads_rest_only_for_entries_the_queue_read_could_not_list():
+    from unittest.mock import patch
+    entries = [{"number": 1, "paths": ["TauCeti/A.lean"]}, {"number": 2, "paths": None}]
+    with patch.object(sweep.backend, "github_entries", return_value=entries) as read, \
+            patch.object(sweep, "pr_paths", return_value=["lean-toolchain"]) as rest:
+        out = sweep.queue_entries()
+    read.assert_called_once_with(sweep.REPO, paths=True)
+    rest.assert_called_once_with(2)
+    assert [e["paths"] for e in out] == [["TauCeti/A.lean"], ["lean-toolchain"]]
+
+
 def test_count_evictions_ignores_our_own_reservation_removals():
     # Booting a PR to clear the way for a bump emits the same removed_from_merge_queue event as a
     # real eviction. Counting ours would escalate an innocent PR to update_branch and needs-rebase.
@@ -622,6 +633,8 @@ def test_main_hands_off_once_then_waits_until_push():
             patch.object(sweep, "queue_entries", return_value=[]), \
             patch.object(sweep.backend, "selected", return_value={"backend": "queue"}), \
             patch.object(sweep.backend, "allow", return_value=True), \
+            patch.object(sweep.backend, "publish_eligibility"), \
+            patch.object(sweep, "bors_approved_prs", return_value=set()), \
             patch.object(sweep, "open_prs", return_value=[{"number": 1, "isDraft": False, "labels": labels if "labels" in locals() else []}]), \
             patch.object(sweep, "gh_json", gh_json), patch.object(sweep, "gh_jsonl", gh_jsonl), \
             patch.object(sweep, "gh", gh), patch.object(sweep, "pr_diff", return_value=["TauCeti/X.lean"]), \
@@ -668,6 +681,8 @@ def test_merge_base_is_rechecked_right_before_enqueue():
                 patch.object(sweep, "queue_entries", return_value=[]), \
             patch.object(sweep.backend, "selected", return_value={"backend": "queue"}), \
             patch.object(sweep.backend, "allow", return_value=True), \
+            patch.object(sweep.backend, "publish_eligibility"), \
+            patch.object(sweep, "bors_approved_prs", return_value=set()), \
             patch.object(sweep, "open_prs", return_value=[{"number": 1, "isDraft": False, "labels": labels if "labels" in locals() else []}]), \
                 patch.object(sweep, "gh_json", gh_json), \
                 patch.object(sweep, "gh_jsonl", return_value=[]), \

@@ -40,6 +40,17 @@ uv tool install git+https://github.com/TauCetiProject/TauCetiReview
 tauceti-review 42
 ```
 
+An installed command stays at the version you installed (`uv tool upgrade tauceti-review` to update).
+Scoreboards you post show its commit as `CLI @ abc1234` in the footer, so you can check it. This
+needs a `git+https` install or a git checkout (where uncommitted changes to tracked files add
+`(modified)`); a `pip install .` copy has no commit to show.
+
+Before each review the CLI also compares the rubrics it will use with the published `main`. If they
+differ (a stale `--repo-dir` or `$TAUCETI_REVIEW_DIR` checkout, a `--rubrics-sha` pin, or local
+edits) it warns, and the posted scoreboard and review threads say so, so PR authors know a finding
+may rest on rules that have since changed. That is expected while you test a rubric change;
+otherwise, update the checkout.
+
 Or from a checkout (also how to hack on it):
 
 ```bash
