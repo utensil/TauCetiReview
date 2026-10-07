@@ -59,10 +59,13 @@ def test_round_archive_records_cli_sha():
                                rubrics_sha=None)
         for pr, dirty in ((1, True), (2, False)):  # a verified-clean CLI is recorded, not omitted
             a.pr = pr
-            prov = {"round": 1, "cli_sha": "c" * 40, "cli_dirty": dirty}
+            policy = {"repo": "utensil/TauCetiReview", "sha": "b" * 40,
+                      "targets": {"rubrics/reuse.md": "d" * 40}}
+            prov = {"round": 1, "cli_sha": "c" * 40, "cli_dirty": dirty, "rubrics_policy": policy}
             review.emit_round_archive(a, prov, "a" * 40, [], [], {}, "approved", None, 0, "", "v")
             rec = json.loads(next(pathlib.Path(outbox).rglob(f"{pr}-1.json")).read_text())
             assert rec["cli_sha"] == "c" * 40 and rec["cli_dirty"] is dirty
+            assert rec["rubrics_policy"] == policy
 
 
 def test_drifted_rubrics_warn_on_scoreboard_and_threads():
@@ -72,7 +75,7 @@ def test_drifted_rubrics_warn_on_scoreboard_and_threads():
     assert render.DRIFT_WARNING in body
     assert json.loads(META_RE.findall(body)[-1])["rubrics_drift"] is True
     thread = render.render_thread({"rubric": "naming", "verdict": "request_changes"}, prov)
-    assert "rubrics checkout differs from published main" in thread
+    assert "rubrics checkout differs from expected published versions" in thread
 
 
 def test_current_or_unchecked_rubrics_do_not_warn():
@@ -81,6 +84,21 @@ def test_current_or_unchecked_rubrics_do_not_warn():
         body = render.render_scoreboard(["naming"], {}, "a" * 40, "approved", "", prov=prov)
         thread = render.render_thread({"rubric": "naming", "verdict": "request_changes"}, prov)
         assert "⚠️ This review" not in body and "differs from published" not in thread
+
+
+def test_pinned_fork_policy_is_disclosed_and_archived_without_hiding_unexpected_drift():
+    policy = {"repo": "utensil/TauCetiReview", "sha": "b" * 40,
+              "targets": {"rubrics/reuse.md": "c" * 40}}
+    for drift in (False, True):
+        prov = {"rubrics_policy": policy, "rubrics_drift": drift}
+        body = render.render_scoreboard(["reuse"], {}, "a" * 40, "approved", "", prov=prov)
+        assert "Fork rubric policy: `reuse`" in body
+        assert f"/blob/{'b' * 40}/rubric-deviations.json" in body
+        assert (render.DRIFT_WARNING in body) == drift
+        assert json.loads(META_RE.findall(body)[-1])["rubrics_policy"] == policy
+        thread = render.render_thread({"rubric": "reuse", "verdict": "request_changes"}, prov)
+        assert "Fork rubric policy: `reuse`" in thread
+        assert json.loads(META_RE.findall(thread)[-1])["rubrics_policy"] == policy
 
 
 def test_unpublished_rubrics_commit_is_not_linked():

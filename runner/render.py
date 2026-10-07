@@ -63,9 +63,20 @@ def linkable_rubrics_sha(prov):
     return None if prov.get("rubrics_published") is False else prov.get("rubrics_sha")
 
 
-DRIFT_WARNING = ("⚠️ This review ran from a rubrics checkout that differs from the published "
-                 "rubrics (out of date, pinned, or locally edited), so its findings may reflect "
-                 "different rules.")
+DRIFT_WARNING = ("⚠️ This review ran from a rubrics checkout that differs from the expected "
+                 "published versions (upstream main plus any explicitly pinned fork rubrics), "
+                 "so its findings may reflect unapproved or outdated rules.")
+
+
+def rubric_policy_note(prov):
+    """Disclose the merged exceptions separately from unexpected rubric drift."""
+    policy = (prov or {}).get("rubrics_policy") or {}
+    if not policy.get("targets"):
+        return ""
+    names = ", ".join(f"`{path.removeprefix('rubrics/').removesuffix('.md')}`"
+                      for path in sorted(policy["targets"]))
+    url = f"https://github.com/{policy['repo']}/blob/{policy['sha']}/rubric-deviations.json"
+    return f"Fork rubric policy: {names} use [explicit content pins]({url}); all other rubrics track upstream main."
 
 
 def rubric_url(prov, rubric=None):
@@ -134,7 +145,9 @@ def render_thread(cf, prov=None):
     label = "published rubric" if (prov or {}).get("rubrics_published") is False else "rubric"
     sub.append(f"[{label}]({rubric_url(prov, cf['rubric'])})")
     if (prov or {}).get("rubrics_drift"):
-        sub.append("⚠️ rubrics checkout differs from published main")
+        sub.append("⚠️ rubrics checkout differs from expected published versions")
+    if rubric_policy_note(prov):
+        sub.append(rubric_policy_note(prov))
     lines += ["", f"<sub>{' · '.join(sub)}</sub>", "",
               meta_block("thread", rubric=cf["rubric"], **thread_meta(cf, prov))]
     return "\n".join(lines)
@@ -181,6 +194,8 @@ def render_scoreboard(candidates, state_map, head_sha, overall, budget_note, cos
              f"errored, stale, or not yet run) blocks the merge. See the [rubrics]({rubric_url(prov)}).", ""]
     if (prov or {}).get("rubrics_drift"):
         lines += [f"> {DRIFT_WARNING}", ""]
+    if rubric_policy_note(prov):
+        lines += [f"> {rubric_policy_note(prov)}", ""]
     lines += ["| | rubric | state | judge | summary |", "|---|---|---|---|---|"]
     for r in candidates:
         cf = state_map.get(r) or {}
