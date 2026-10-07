@@ -63,11 +63,6 @@ def linkable_rubrics_sha(prov):
     return None if prov.get("rubrics_published") is False else prov.get("rubrics_sha")
 
 
-DRIFT_WARNING = ("⚠️ This review ran from a rubrics checkout that differs from the published "
-                 "rubrics (out of date, pinned, or locally edited), so its findings may reflect "
-                 "different rules.")
-
-
 def rubric_url(prov, rubric=None):
     """Link to the rubrics pinned at the exact commit reviewed from, falling back to main."""
     repo = (prov or {}).get("rubrics_repo", "TauCetiProject/TauCetiReview")
@@ -133,8 +128,6 @@ def render_thread(cf, prov=None):
     # Linked to main when the commit that ran is not on GitHub, so say it is the published text.
     label = "published rubric" if (prov or {}).get("rubrics_published") is False else "rubric"
     sub.append(f"[{label}]({rubric_url(prov, cf['rubric'])})")
-    if (prov or {}).get("rubrics_drift"):
-        sub.append("⚠️ rubrics checkout differs from published main")
     lines += ["", f"<sub>{' · '.join(sub)}</sub>", "",
               meta_block("thread", rubric=cf["rubric"], **thread_meta(cf, prov))]
     return "\n".join(lines)
@@ -179,8 +172,6 @@ def render_scoreboard(candidates, state_map, head_sha, overall, budget_note, cos
              "Each rubric is judged independently by multiple review agents; the PR merges only once "
              "**every** rubric is green — any rubric that is not green (changes requested, blocked, "
              f"errored, stale, or not yet run) blocks the merge. See the [rubrics]({rubric_url(prov)}).", ""]
-    if (prov or {}).get("rubrics_drift"):
-        lines += [f"> {DRIFT_WARNING}", ""]
     lines += ["| | rubric | state | judge | summary |", "|---|---|---|---|---|"]
     for r in candidates:
         cf = state_map.get(r) or {}

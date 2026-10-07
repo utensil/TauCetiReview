@@ -387,7 +387,7 @@ def test_rubric_blobs_match_git_and_cover_only_reviewed_files():
         assert blobs["rubrics/a.md"] == want
 
 
-def _publication(listing, commit, local):
+def _publication(listing, commit, local, targets=None):
     """rubrics_publication against canned `gh api` answers: `listing`/`commit` are (rc, stdout,
     stderr) for the tree listing and the commit lookup."""
     def fake_run(cmd, **kwargs):
@@ -397,7 +397,105 @@ def _publication(listing, commit, local):
     with tempfile.TemporaryDirectory() as d, patch.object(cli, "run", fake_run):
         for name, text in local.items():
             (pathlib.Path(d) / name).write_text(text)
-        return cli.rubrics_publication(d, "s" * 40)
+        return cli.rubrics_publication(d, "s" * 40, targets)
+
+
+def test_merged_fork_pins_allow_only_the_exact_rubric_content():
+    with tempfile.TemporaryDirectory() as d:
+        (pathlib.Path(d) / "reuse.md").write_text("approved fork rule\n")
+        pin = cli.rubric_blobs(d)["rubrics/reuse.md"]
+        (pathlib.Path(d) / "naming.md").write_text("upstream naming\n")
+        naming = cli.rubric_blobs(d)["rubrics/naming.md"]
+    listing = (0, json.dumps({"tree": [
+        {"path": "rubrics/reuse.md", "type": "blob", "sha": "0" * 40},
+        {"path": "rubrics/naming.md", "type": "blob", "sha": naming}]}), "")
+    published = (0, "s" * 40, "")
+    targets = {"rubrics/reuse.md": pin}
+    current = {"reuse.md": "approved fork rule\n", "naming.md": "upstream naming\n"}
+    assert _publication(listing, published, current) == (True, True)
+    assert _publication(listing, published, current, targets) == (False, True)
+    for edited in (
+        {**current, "reuse.md": "unapproved next fork rule\n"},
+        {**current, "naming.md": "unlisted difference\n"},
+        {"naming.md": "upstream naming\n"},
+        {**current, "new.md": "unexpected added rubric\n"},
+    ):
+        assert _publication(listing, published, edited, targets) == (True, True)
+    assert _publication((1, "", "offline"), published, current, targets) == (None, True)
+    # A later upstream change to an unlisted rubric remains detectable.
+    newer = (0, listing[1].replace(naming, "f" * 40), "")
+    assert _publication(newer, published, current, targets) == (True, True)
+
+
+def _merged_policy_fixture(policy=None):
+    import base64
+    import hashlib
+    sha, pin = "a" * 40, "b" * 40
+    data = json.dumps(policy or {"version": 1, "rubrics": {"reuse": pin}}).encode()
+    blob = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+    responses = {
+        "commits/dev": {"sha": sha},
+        f"git/trees/{sha}?recursive=1": {"tree": [
+            {"path": "rubric-deviations.json", "type": "blob", "mode": "100644", "sha": blob},
+            {"path": "rubrics/reuse.md", "type": "blob", "mode": "100644", "sha": pin}]},
+        f"git/blobs/{blob}": {"encoding": "base64", "content": base64.b64encode(data).decode()},
+    }
+    return responses
+
+
+def _read_merged_policy(responses):
+    def fake_run(cmd, **kwargs):
+        prefix = f"/repos/{cli.RUBRIC_POLICY_REPO}/"
+        assert cmd[:2] == ["gh", "api"] and cmd[2].startswith(prefix), cmd
+        route = cmd[2][len(prefix):]
+        # Every fetch after resolving dev MUST use its immutable commit/blob, never a moving ref.
+        assert route in responses, route
+        value = responses[route]
+        return types.SimpleNamespace(returncode=1 if value is None else 0,
+                                     stdout=json.dumps(value), stderr="")
+    with patch.object(cli, "run", fake_run):
+        return cli.published_rubric_policy()
+
+
+def test_rubric_allowlist_is_loaded_only_from_the_merged_snapshot():
+    responses = _merged_policy_fixture()
+    policy = _read_merged_policy(responses)
+    assert policy == {"repo": cli.RUBRIC_POLICY_REPO, "sha": "a" * 40,
+                      "targets": {"rubrics/reuse.md": "b" * 40}}
+    # No policy on dev: a draft/local allowlist cannot authorize a difference.
+    responses[f"git/trees/{'a' * 40}?recursive=1"]["tree"].pop(0)
+    assert _read_merged_policy(responses) == {}
+
+
+def test_stale_malformed_or_unreadable_policy_grants_no_exceptions():
+    for policy in (
+        {"version": 2, "rubrics": {"reuse": "b" * 40}},
+        {"version": 1, "rubrics": {"reuse": "c" * 40}},
+        {"version": 1, "rubrics": {"reuse": "b" * 7}},
+        {"version": 1, "rubrics": {"../reuse": "b" * 40}},
+        {"version": 1, "rubrics": {"_common": "b" * 40}},
+        {"version": 1, "rubrics": {"missing": "b" * 40}},
+        {"version": 1, "rubrics": ["reuse"]},
+    ):
+        assert _read_merged_policy(_merged_policy_fixture(policy)) is None, policy
+    for failure in ("offline", "truncated", "symlink", "changed-blob"):
+        responses = _merged_policy_fixture()
+        tree = responses[f"git/trees/{'a' * 40}?recursive=1"]
+        if failure == "offline":
+            responses["commits/dev"] = None
+        elif failure == "truncated":
+            tree["truncated"] = True
+        elif failure == "symlink":
+            tree["tree"][0]["mode"] = "120000"
+        else:
+            next(v for k, v in responses.items() if k.startswith("git/blobs/"))["content"] = "e30="
+        assert _read_merged_policy(responses) is None, failure
+
+
+def test_repository_rubric_pins_match_the_proposed_content():
+    root = pathlib.Path(__file__).resolve().parent.parent
+    policy = json.loads((root / cli.RUBRIC_POLICY_FILE).read_text())
+    cli.rubric_policy_targets(policy, cli.rubric_blobs(root / "rubrics"))
 
 
 def test_rubrics_publication_detects_drift_and_unpublished_commits():
@@ -442,22 +540,6 @@ def test_other_422s_leave_publication_unknown():
     tree = (0, json.dumps({"tree": [{"path": "rubrics/a.md", "type": "blob", "sha": blob}]}), "")
     spam = (1, "", "gh: Validation Failed (HTTP 422)")
     assert _publication(tree, spam, {"a.md": "alpha\n"}) == (False, None)
-
-
-def test_drift_warning_matches_engine_and_is_added_once():
-    import render
-    assert cli.DRIFT_WARNING == render.DRIFT_WARNING
-    with tempfile.TemporaryDirectory() as d:
-        sb = pathlib.Path(d) / "scoreboard.md"
-        sb.write_text("<!--tauceti-scoreboard-->\n## AI review\n\nintro\n\n| | rubric |\n|---|---|\n")
-        cli.ensure_drift_warning(sb)
-        text = sb.read_text()
-        assert text.index(cli.DRIFT_WARNING) < text.index("| | rubric |")
-        cli.ensure_drift_warning(sb)  # an engine that already rendered it is left alone
-        assert sb.read_text().count(cli.DRIFT_WARNING) == 1
-        sb.write_text("## AI review\nno table\n")
-        cli.ensure_drift_warning(sb)
-        assert sb.read_text().split("\n")[1] == f"> {cli.DRIFT_WARNING}"
 
 
 if __name__ == "__main__":

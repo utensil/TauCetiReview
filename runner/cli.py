@@ -23,6 +23,7 @@ two you have available.
 """
 import argparse
 import atexit
+import base64
 import hashlib
 import json
 import os
@@ -43,6 +44,8 @@ import uuid
 PROVIDER_DOWN_EXIT = 3
 
 REVIEW_REPO = "TauCetiProject/TauCetiReview"
+RUBRIC_POLICY_REPO = "utensil/TauCetiReview"
+RUBRIC_POLICY_FILE = "rubric-deviations.json"
 DEFAULT_CODE_REPO = "TauCetiProject/TauCeti"
 DEFAULT_ROADMAP_REPO = "TauCetiProject/TauCetiRoadmap"
 REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -282,15 +285,77 @@ def published_rubric_blobs():
             if e.get("type") == "blob" and re.fullmatch(r"rubrics/(references/)?[^/]+\.md", e["path"])}
 
 
-def rubrics_publication(rubrics_dir, sha):
+def rubric_policy_targets(policy, blobs):
+    """Validate explicit content pins against the SAME merged tree as the policy file.
+
+    Only named rubrics can diverge; shared instructions and references stay upstream-controlled.
+    A stale pin or malformed entry rejects the whole policy rather than widening an exception.
+    """
+    if not isinstance(policy, dict) or set(policy) != {"version", "rubrics"}:
+        raise ValueError("invalid rubric policy")
+    if type(policy["version"]) is not int or policy["version"] != 1:
+        raise ValueError("unsupported rubric policy version")
+    entries = policy["rubrics"]
+    if not isinstance(entries, dict):
+        raise ValueError("rubric pins must be a mapping")
+    targets = {}
+    for name, sha in entries.items():
+        if (not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9-]*", name)
+                or not isinstance(sha, str) or not EXACT_COMMIT_RE.fullmatch(sha)):
+            raise ValueError("invalid rubric name or content hash")
+        path = f"rubrics/{name}.md"
+        if blobs.get(path) != sha:
+            raise ValueError(f"rubric pin does not match merged content: {name}")
+        targets[path] = sha
+    return targets
+
+
+def published_rubric_policy():
+    """Read only the policy merged to our fork's dev, at one immutable snapshot.
+
+    Local files and PR heads never grant exceptions. Missing policy means strict upstream
+    parity; unreadable/invalid policy returns None so callers retain that strict comparison.
+    """
+    def read(route):
+        r = run(["gh", "api", f"/repos/{RUBRIC_POLICY_REPO}/{route}"],
+                capture=True, quiet=True, allow_fail=True)
+        if r.returncode:
+            raise ValueError("rubric policy lookup failed")
+        return json.loads(r.stdout)
+
+    try:
+        sha = read("commits/dev")["sha"]
+        if not isinstance(sha, str) or not EXACT_COMMIT_RE.fullmatch(sha):
+            raise ValueError("invalid policy commit")
+        tree = read(f"git/trees/{sha}?recursive=1")
+        if tree.get("truncated") or not isinstance(tree.get("tree"), list):
+            raise ValueError("incomplete policy tree")
+        blobs = {e["path"]: e["sha"] for e in tree["tree"]
+                 if e.get("type") == "blob" and e.get("mode") == "100644"}
+        if not any(e.get("path") == RUBRIC_POLICY_FILE for e in tree["tree"]):
+            return {}
+        blob = blobs[RUBRIC_POLICY_FILE]
+        payload = read(f"git/blobs/{blob}")
+        if payload.get("encoding") != "base64":
+            raise ValueError("invalid policy blob encoding")
+        data = base64.b64decode(payload["content"])
+        if hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest() != blob:
+            raise ValueError("policy blob hash mismatch")
+        targets = rubric_policy_targets(json.loads(data), blobs)
+        return {"repo": RUBRIC_POLICY_REPO, "sha": sha, "targets": targets}
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def rubrics_publication(rubrics_dir, sha, targets=None):
     """(drift, published) for the rubrics a review is about to run with. `drift`: their text differs
-    from TauCetiReview's published main (a stale or pinned checkout, or local edits), which a PR
-    author contesting a finding cannot see from the review alone. `published`: `sha` exists on
-    GitHub, so links pinned to it resolve. Each is None when it could not be checked; neither check
-    ever aborts a review."""
+    from upstream main plus exact merged fork content pins. `published`: `sha` exists on GitHub,
+    so links pinned to it resolve. Each is None when it could not be checked; neither check aborts
+    a review."""
     main_blobs = published_rubric_blobs()
     local_blobs = rubric_blobs(rubrics_dir)
-    drift = None if main_blobs is None or local_blobs is None else local_blobs != main_blobs
+    expected = None if main_blobs is None else {**main_blobs, **(targets or {})}
+    drift = None if expected is None or local_blobs is None else local_blobs != expected
     published = None
     if sha:
         r = run(["gh", "api", f"/repos/{REVIEW_REPO}/commits/{sha}", "--jq", ".sha"],
@@ -300,28 +365,6 @@ def rubrics_publication(rubrics_dir, sha):
         elif "No commit found" in (r.stderr or ""):  # not throttling or another 422
             published = False
     return drift, published
-
-
-# Duplicated from render.DRIFT_WARNING for the same reason as PROVIDER_DOWN_EXIT; tests/test_cli.py
-# pins the two together.
-DRIFT_WARNING = ("⚠️ This review ran from a rubrics checkout that differs from the published "
-                 "rubrics (out of date, pinned, or locally edited), so its findings may reflect "
-                 "different rules.")
-
-
-def ensure_drift_warning(scoreboard):
-    """Put DRIFT_WARNING on a scoreboard an engine wrote without it: an engine predating the
-    TAUCETI_RUBRICS_DRIFT flag (a stale --repo-dir is exactly the case being flagged) ignores it.
-    Inserted above the rubric table, or after the heading if there is none."""
-    path = pathlib.Path(scoreboard)
-    lines = path.read_text().split("\n")
-    if any(DRIFT_WARNING in line for line in lines):
-        return
-    at = next((i for i, line in enumerate(lines) if line.startswith("| |")), None)
-    if at is None:
-        at = next((i + 1 for i, line in enumerate(lines) if line.startswith("## ")), 0)
-    lines[at:at] = [f"> {DRIFT_WARNING}", ""]
-    path.write_text("\n".join(lines))
 
 
 def tristate(flag):
@@ -942,17 +985,23 @@ def main():
     # By environment rather than a flag, so a --rubrics-sha pin to an engine predating it still runs.
     # Only the engine's environment: an embedding caller's os.environ must not carry it onward.
     sha, dirty = cli_sha()
-    drift, published = rubrics_publication(repo_dir / "rubrics", rub_sha)
+    policy = published_rubric_policy()
+    if policy is None:
+        print("tauceti-review: WARNING: merged fork rubric policy could not be verified; "
+              "comparing every rubric with upstream main.", file=sys.stderr)
+    drift, published = rubrics_publication(repo_dir / "rubrics", rub_sha,
+                                          (policy or {}).get("targets"))
     if drift:
         print(f"tauceti-review: WARNING: the rubrics in {repo_dir} differ from {REVIEW_REPO}'s "
-              "published main. This review applies them anyway and the scoreboard will say so; "
+              "published main plus the verified fork pins. This review applies them anyway; "
               "update the checkout unless you are testing a rubric change.", file=sys.stderr)
     if published is False:
         print(f"tauceti-review: WARNING: rubrics commit {rub_sha[:12]} is not on GitHub, so PR "
               "authors cannot read the rubric text this review used.", file=sys.stderr)
     engine_env = {**os.environ, "TAUCETI_CLI_SHA": sha, "TAUCETI_CLI_DIRTY": "1" if dirty else "0",
                   "TAUCETI_RUBRICS_DRIFT": tristate(drift),
-                  "TAUCETI_RUBRICS_PUBLISHED": tristate(published)}
+                  "TAUCETI_RUBRICS_PUBLISHED": tristate(published),
+                  "TAUCETI_RUBRIC_POLICY": json.dumps(policy or {})}
     # Shadow outbox lives under the PERSISTENT store, not the throwaway scratch one: if the
     # sync at the end fails, the records must survive the workspace cleanup for a later sync.
     outbox_store = (CACHE_DIR / "store" / a.repo.replace("/", "__")) if a.shadow else store
@@ -1003,8 +1052,6 @@ def main():
     sb = (work / "scoreboard.md")
     if not sb.is_file():
         die(f"review step exited cleanly but produced no scoreboard ({sb}); the engine did not run.")
-    if drift:
-        ensure_drift_warning(sb)
     print("\n" + "=" * 72)
     print(sb.read_text())
     threads = sorted((work / "threads").glob("*.md")) if (work / "threads").is_dir() else []

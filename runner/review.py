@@ -208,6 +208,7 @@ def emit_round_archive(a, prov, head, ran, run_results, states, overall, halted,
             "cli_sha": prov.get("cli_sha"), "cli_dirty": prov.get("cli_dirty"),
             "rubrics_drift": prov.get("rubrics_drift"),
             "rubrics_published": prov.get("rubrics_published"),
+            "rubrics_policy": prov.get("rubrics_policy"),
             "diff_sha256": prov.get("diff_sha256"), "ran": ran,
             "run_ids": run_ids, "states": states,
             "overall": overall, "cost": round_cost, "halted_at": halted,
@@ -488,6 +489,7 @@ def run_rubric(ctx, rubric):
             "cli_sha": prov.get("cli_sha"), "cli_dirty": prov.get("cli_dirty"),
             "rubrics_drift": prov.get("rubrics_drift"),
             "rubrics_published": prov.get("rubrics_published"),
+            "rubrics_policy": prov.get("rubrics_policy"),
             "provider": provider, "model": model, "mode": a.mode, "auth": a.auth,
             "ci": bool(os.environ.get("GITHUB_ACTIONS")) or None,
             "prompt_sha256": res["prompt_sha256"],
@@ -810,11 +812,12 @@ def main():
             # the check, so a verified-clean CLI stays distinguishable from an unchecked one.
             "cli_dirty": ({"1": True, "0": False}.get(os.environ.get("TAUCETI_CLI_DIRTY", ""))
                           if os.environ.get("TAUCETI_CLI_SHA") else None),
-            # Whether these rubrics differ from TauCetiReview's published main, and whether
+            # Whether these rubrics differ from upstream plus merged fork pins, and whether
             # --rubrics-sha is on GitHub (set by runner/cli.py). None (omitted) when unchecked.
             "rubrics_drift": {"1": True, "0": False}.get(os.environ.get("TAUCETI_RUBRICS_DRIFT", "")),
             "rubrics_published": {"1": True, "0": False}.get(
-                os.environ.get("TAUCETI_RUBRICS_PUBLISHED", ""))}
+                os.environ.get("TAUCETI_RUBRICS_PUBLISHED", "")),
+            "rubrics_policy": json.loads(os.environ.get("TAUCETI_RUBRIC_POLICY") or "{}") or None}
     pr_state = ledger["prs"].setdefault(str(a.pr), {})
     pr_state.setdefault("rounds", [])
     pr_state.setdefault("state", {})            # per-rubric case files (= scoreboard/staleness)

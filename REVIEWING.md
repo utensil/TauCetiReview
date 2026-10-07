@@ -45,11 +45,40 @@ Scoreboards you post show its commit as `CLI @ abc1234` in the footer, so you ca
 needs a `git+https` install or a git checkout (where uncommitted changes to tracked files add
 `(modified)`); a `pip install .` copy has no commit to show.
 
-Before each review the CLI also compares the rubrics it will use with the published `main`. If they
-differ (a stale `--repo-dir` or `$TAUCETI_REVIEW_DIR` checkout, a `--rubrics-sha` pin, or local
-edits) it warns, and the posted scoreboard and review threads say so, so PR authors know a finding
-may rest on rules that have since changed. That is expected while you test a rubric change;
-otherwise, update the checkout.
+Before each review the CLI compares the rubrics it will use with upstream's published `main`,
+except for exact content pins approved by this fork's rubric policy below. Unexpected differences
+(a stale checkout, an older pin, or local edits) produce a CLI warning. Public review comments
+keep the existing rubric commit-hash links without additional policy notes or drift warnings.
+The policy and drift status remain in machine-readable metadata and archives.
+
+### Approved fork rubric differences
+
+[`rubric-deviations.json`](rubric-deviations.json) explicitly lists the named rubrics allowed to
+differ from upstream and each one's target **Git blob SHA-1**. These are content hashes, not
+commit hashes: the reviewed bytes can be pinned before merging without a self-referential merge
+commit. Merging the rubric and its pin together to `utensil/TauCetiReview:dev` approves that target.
+The initial allowlist preserves the fork's `api-design` and `reuse` additions.
+
+The CLI resolves `dev` to an immutable commit, reads the policy at that snapshot, and checks each
+pin against the rubric in the same tree. It does not trust a local policy file or a draft PR.
+For listed rubrics, only the approved bytes are accepted; every unlisted rubric, shared instruction,
+and reference file must still match upstream. A file name alone never permits arbitrary edits.
+Missing, malformed, stale, or unreadable policy cannot grant an exception. An unreadable or invalid
+policy emits a warning and falls back to the ordinary upstream comparison; an unreadable upstream
+tree still leaves drift unknown rather than declaring a match. Warnings remain nonfatal.
+
+To change an exception, edit its rubric and update its entry in the same PR. Compute the target
+using the CLI's hashing function (which normalizes CRLF to LF, just like prompt loading):
+
+```bash
+python -c 'from runner.cli import rubric_blobs; print(rubric_blobs("rubrics")["rubrics/reuse.md"])'
+```
+
+CI rejects a policy whose content pins disagree with the proposed rubric files. The new target
+becomes active only after the PR is merged to `dev`; it does not require a post-merge bot commit.
+To return a rubric to upstream tracking, remove its entry and restore upstream's text in the same
+PR. Review metadata and archived runs/rounds retain the policy snapshot and full target hashes;
+the existing rubric fingerprint continues to describe the actual text used, not the allowlist.
 
 Or from a checkout (also how to hack on it):
 
