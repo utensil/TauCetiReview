@@ -11,6 +11,7 @@ import pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "runner"))
 import review  # noqa: E402  (runner/ on path; same import the engine uses)
+import pricing  # noqa: E402
 
 
 def test_every_dispatchable_model_is_priced():
@@ -25,6 +26,12 @@ def test_explicit_codex_model_is_priced():
         m for m in review.dispatch_models(codex_model="gpt-6.1-sol") if m not in review.PRICES
     )
     assert not missing, f"explicit gpt-6.1-sol review model is unpriced: {missing}"
+
+
+def test_default_claude_is_opus_55_with_its_own_rates():
+    assert review.CLAUDE_MODEL == "claude-opus-5-5"
+    assert review.PRICES[review.CLAUDE_MODEL] == (4.0, 20.0)
+    assert pricing.CACHE_READ[review.CLAUDE_MODEL] == 0.2
 
 
 def test_price_windows_are_well_formed():

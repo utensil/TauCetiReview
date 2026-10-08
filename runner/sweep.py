@@ -45,6 +45,7 @@ import os
 import subprocess
 import sys
 import hashlib
+import itertools
 
 import backend
 import api_budget
@@ -568,8 +569,11 @@ def open_prs():
     return [{**p, "isDraft": p["draft"]} for page in pages for p in page]
 
 
-def candidates(prs, queue_prs, bors_prs):
-    """Labels select work, never authorize it. Existing approvals take priority.
+def candidates(prs, queue_prs, bors_prs, *, admit=True):
+    """Labels select work, never authorize it. Existing approvals go first, then alternate
+    with labelled PRs: a bounded run covers far fewer PRs than a busy queue holds, so the queue
+    placed wholly ahead would strand every green PR awaiting admission, including those refused
+    during a backend handoff.
 
     Hourly background ordering changes so a bounded run does not always strand the
     same old PRs. Both main queues are inspected under either backend selection.
@@ -594,7 +598,13 @@ def candidates(prs, queue_prs, bors_prs):
     for group in (priority, hinted):
         if group:
             group.sort(key=lambda p: hashlib.sha256(f"{slot}:{p['number']}".encode()).digest())
-    return priority + hinted + ([] if FOCUSED else background)
+    # With admission paused, spend the bounded run on existing approvals first.
+    # Published eligibility describes the reviewed head independently of the
+    # backend; live backend/drain guards still decide whether it can be admitted.
+    if not admit:
+        return priority + hinted + ([] if FOCUSED else background)
+    alternated = [p for pair in itertools.zip_longest(priority, hinted) for p in pair if p is not None]
+    return alternated + ([] if FOCUSED else background)
 
 
 def bors_approved_prs():
@@ -699,7 +709,7 @@ def main():
             membership_unknown = True
     # Incomplete observations expand withdrawal checks; they never grant admission.
     bors_priority = {p["number"] for p in prs} if membership_unknown else bors_prs
-    selected_prs = candidates(prs, queue_prs, bors_priority)
+    selected_prs = candidates(prs, queue_prs, bors_priority, admit=mode == "bors")
     if mode == "bors":
         return sweep_bors(selected_prs)
     if mode == "unknown":
@@ -723,7 +733,7 @@ def main():
 
     if not backend.allow(REPO, "queue"):
         print("merge-sweep: native reservation/recovery deferred during drainage")
-        return sweep_bors(cand, admit=False)
+        return sweep_bors(candidates(prs, in_queue, bors_priority, admit=False), admit=False)
 
     # The merge-queue reservation. A pin-moving PR rebuilds everything (83-95 min), and anything
     # landing under it that the new mathlib deprecates evicts it, so it gets the queue to itself.
@@ -754,6 +764,7 @@ def main():
         print(f"merge-sweep: merge queue reserved for pin-moving #{holder}; "
               "clearing other entries and holding new ones")
         failures += reconcile_reservation(entries, holder)
+        cand = candidates(prs, in_queue, bors_priority, admit=False)
 
     for p in cand:
         api_budget.begin_pr()
