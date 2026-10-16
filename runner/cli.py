@@ -753,10 +753,8 @@ def main():
                          "another reviewer is already running on the same head — so a fleet doesn't "
                          "pay twice for identical work. Pass this to review without touching the PR "
                          "(e.g. a private read-only pass), at the cost of possible duplicate spend.")
-    ap.add_argument("--max-rounds-per-day", type=int, default=12,
-                    help="per-PR daily round cap (UTC day); past this the run refuses without spending. "
-                         "Forwarded to review.py. Exposing it here lets a caller (e.g. the worker, whose "
-                         "survey prefilters capped PRs) drive the prefilter and the engine from one value.")
+    # Older workers pass this flag. Accept it during rolling upgrades without limiting reviews.
+    ap.add_argument("--max-rounds-per-day", type=int, help=argparse.SUPPRESS)
     a = ap.parse_args()
 
     a.kiro_model = (a.kiro_model or "").strip()
@@ -1024,7 +1022,6 @@ def main():
            "--providers", providers, "--daily-budget", "1000000", "--no-post",
            *codex_review_args(a.codex_model, a.codex_effort),
            "--kiro-model", a.kiro_model,
-           "--max-rounds-per-day", str(a.max_rounds_per_day),
            "--scoreboard-file", str(work / "scoreboard.md"),
            "--threads-dir", str(work / "threads"), "--post-plan-file", str(plan),
            "--replies-json", str(replies_path), "--prior-scoreboard-json", str(prior_board_path)]
@@ -1052,6 +1049,7 @@ def main():
     sb = (work / "scoreboard.md")
     if not sb.is_file():
         die(f"review step exited cleanly but produced no scoreboard ({sb}); the engine did not run.")
+    review_error = not a.shadow and plan.is_file() and json.loads(plan.read_text()).get("review_error", False)
     print("\n" + "=" * 72)
     print(sb.read_text())
     threads = sorted((work / "threads").glob("*.md")) if (work / "threads").is_dir() else []
@@ -1095,6 +1093,9 @@ def main():
         shutil.rmtree(work, ignore_errors=True)
     elif a.keep:
         print(f"workspace kept at {work}", file=sys.stderr)
+
+    if review_error:
+        die("review completed with rubric errors; see the scoreboard")
 
 
 if __name__ == "__main__":

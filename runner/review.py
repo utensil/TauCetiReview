@@ -15,7 +15,7 @@ import archive
 from dataclasses import dataclass, field
 
 from ledger import Ledger
-from pricing import CLAUDE_MODEL, CODEX_FALLBACK_MODEL, CODEX_MODEL, KIRO_MODEL, OPENROUTER_MODELS, PRICES_SHA, SONNET_MODEL, require_priced, sum_usage
+from pricing import CLAUDE_MODEL, CODEX_FALLBACK_MODEL, CODEX_MODEL, KIRO_MODEL, OPENROUTER_MODELS, PRICES_SHA, SONNET_MODEL, sum_usage, warn_unpriced
 # Re-exported for merge_from_scoreboard (changed_paths/decide_merge/DEFAULT_RUBRICS) and the price
 # tests, which read these as review.X — kept importable here though review.py no longer uses them.
 from pricing import PRICES, _PRICE_WINDOWS, dispatch_models  # noqa: F401
@@ -243,14 +243,12 @@ def thread_action_rubrics(candidates, ran, state_map, head):
 
 
 def render_thread_plan(candidates, ran, state_map, head, prov, paths, threads_dir,
-                       merge_path_prefix, had_contest=None, repairs_only=False):
+                       merge_path_prefix, had_contest=None):
     """Render the thread half of a trusted post plan.
 
     Required adverse upserts are the review-publication transaction: the final scoreboard may not
     land until they do.  Close notes and direct contest answers remain best-effort UI actions.
-    `repairs_only` is used by the daily-cap path, where no model may run but persisted findings must
-    still be made contestable. `paths` are the PR's changed paths (`changed_file_paths`), the only
-    files a thread may anchor to.
+    `paths` are the PR's changed paths (`changed_file_paths`), the only files a thread may anchor to.
     """
     had_contest = had_contest or {}
     paths_sorted = sorted(paths)
@@ -258,8 +256,7 @@ def render_thread_plan(candidates, ran, state_map, head, prov, paths, threads_di
                          paths_sorted[0] if paths_sorted else "")
     threads_dir.mkdir(parents=True, exist_ok=True)
     actions = []
-    for rubric in thread_action_rubrics(candidates, [] if repairs_only else ran,
-                                        state_map, head):
+    for rubric in thread_action_rubrics(candidates, ran, state_map, head):
         cf = state_map.get(rubric) or {}
         s = state_of(cf, head)
         thread = cf.get("thread")
@@ -271,7 +268,7 @@ def render_thread_plan(candidates, ran, state_map, head, prov, paths, threads_di
                  "run_id": cf.get("run_id"), "body": str(bpath),
                  "comment_id": (thread or {}).get("comment_id"),
                  "path": pick_anchor(cf, fallback_path, set(paths_sorted))})
-        elif not repairs_only and s in ("green", "stale") and thread:
+        elif s in ("green", "stale") and thread:
             bpath.write_text(f"<!--tauceti-rubric:{rubric}-->\n### ✅ {rubric} — now passing on "
                              f"`{head[:7]}`.\n\n"
                              + meta_block("thread", rubric=rubric, **thread_meta(cf, prov)))
@@ -279,8 +276,7 @@ def render_thread_plan(candidates, ran, state_map, head, prov, paths, threads_di
                 {"rubric": rubric, "action": "close", "required": False,
                  "body": str(bpath), "comment_id": thread.get("comment_id"),
                  "node_id": thread.get("node_id")})
-        if (not repairs_only and rubric in had_contest
-                and (thread or {}).get("comment_id") and s != "error"):
+        if (rubric in had_contest and (thread or {}).get("comment_id") and s != "error"):
             rpath = threads_dir / f"{rubric}.reply.md"
             rpath.write_text(render_contest_reply(cf, head, prov,
                                                   answered_id=had_contest[rubric]))
@@ -408,7 +404,7 @@ def run_rubric(ctx, rubric):
         # (TauCetiReview#105). It is a closed vocabulary, so unlike the stderr it derives from, it is
         # safe in a record that gets committed and pushed.
         attempts.append({k: r[k] for k in ("returncode", "cost_usd", "cost_estimated",
-                                           "usage", "session_id", "parse_error", "reasoning_effort")
+                                           "price_inherited", "usage", "session_id", "parse_error", "reasoning_effort")
                          if r.get(k) is not None}
                         | {"model": model, "secs": round(time.monotonic() - t, 1)}
                         | ({} if has_verdict(r) else {"error_kind": error_kind(r)}))
@@ -447,8 +443,8 @@ def run_rubric(ctx, rubric):
     # skip the now-known-dead Sol call — but ONLY once the fallback has actually produced a verdict. With
     # the reconfirm above, that means: rejected twice on the default AND the fallback then worked. Runs
     # dispatch rubrics sequentially, so the mutation races nothing; the registry is rebuilt from
-    # CODEX_MODEL every run, so Sol is re-probed next run. (require_priced covers the fallback, so this
-    # never routes to an unpriced model.)
+    # CODEX_MODEL every run, so Sol is re-probed next run. (dispatch_models lists the fallback and a
+    # test enforces its price, so this routes to a priced model.)
     if downgraded and has_verdict(res):
         print(f"[{rubric}] codex model {requested} unavailable to this account — using {model} for "
               f"the rest of this run", file=sys.stderr)
@@ -508,6 +504,9 @@ def run_rubric(ctx, rubric):
             "attempts": public_record(attempts),
             "usage": res.get("usage"), "cost_usd": res.get("cost_usd"),
             "cost_estimated": res.get("cost_estimated"), "prices_sha": PRICES_SHA,
+            # Set only when prices.json had no row for this model, naming the model whose rates
+            # were used, so an inherited rate is visible beside the sha of the table it came from.
+            "price_inherited": res.get("price_inherited"),
             "verdict": vo.get("verdict") or "error",
             "summary": vo.get("summary"), "findings": vo.get("findings") or [],
             "fidelity": "exact",
@@ -610,8 +609,6 @@ def main():
     ap.add_argument("--max-call-cost", type=float, default=1.0,
                     help="reservation per rubric: skip a rubric if spend so far plus this would "
                          "exceed the daily budget (a hard-ish per-call ceiling, not post-spend)")
-    ap.add_argument("--max-rounds-per-day", type=int, default=12,
-                    help="per-PR cap on paid review rounds in a single UTC day (abuse limit)")
     ap.add_argument("--head-sha", default="",
                     help="PR head commit; approvals are bound to it, so a new commit re-runs all "
                          "blocking rubrics instead of carrying forward stale approvals")
@@ -919,37 +916,6 @@ def main():
         print(f"[merge] {merge_ok}: {reason}")
         return
 
-    # Per-PR daily round cap: bound how often one PR can spend (rapid commits or repeated
-    # /review); the global daily budget still applies on top. Checked after init. Persisted adverse
-    # results are still published here without a model call: a spend cap must never strand a
-    # scoreboard-only blocker that the author cannot contest.
-    todays_rounds = sum(1 for r in pr_state["rounds"] if (r.get("ts") or "").startswith(today()))
-    if todays_rounds >= a.max_rounds_per_day:
-        outdir = store / "reviews" / str(a.pr) / str(round_num)
-        outdir.mkdir(parents=True, exist_ok=True)
-        overall = (f"paused (daily round cap reached, {todays_rounds}/{a.max_rounds_per_day}; "
-                   "reviews resume next UTC day)")
-        sb = render_scoreboard(candidates, state_map, head, overall, "", prov=prov)
-        sb_path = pathlib.Path(a.scoreboard_file) if a.scoreboard_file else (outdir / "scoreboard.md")
-        sb_path.write_text(sb)
-        (outdir / "scoreboard.md").write_text(sb)
-        diff_full = pathlib.Path(a.diff_file).read_text()
-        threads_dir = pathlib.Path(a.threads_dir) if a.threads_dir else (outdir / "threads")
-        thread_actions = render_thread_plan(
-            candidates, [], state_map, head, prov, changed_file_paths(a, diff_full), threads_dir,
-            a.merge_path_prefix, repairs_only=True)
-        if a.post_plan_file:
-            pathlib.Path(a.post_plan_file).write_text(json.dumps(
-                {"head_sha": head, "round": round_num,
-                 "scoreboard_comment_id": pr_state.get("scoreboard_comment_id"),
-                 "scoreboard_body": str(sb_path), "threads": thread_actions}, indent=2))
-        if a.merge_decision_file:
-            pathlib.Path(a.merge_decision_file).write_text(json.dumps(
-                {"merge": False, "reason": "per-PR daily round cap reached", "head_sha": head}))
-        print(f"per-PR daily round cap reached for #{a.pr} "
-              f"({todays_rounds}/{a.max_rounds_per_day}); skipping without spending.")
-        return
-
     reply_text = ""
     if a.reply_file and pathlib.Path(a.reply_file).exists():
         reply_text = pathlib.Path(a.reply_file).read_text()[:8000].strip()
@@ -1049,7 +1015,7 @@ def main():
     dispatchable = {runners[p][1] for p in providers if p != "kiro"}
     if "codex" in providers:
         dispatchable.add(CODEX_FALLBACK_MODEL)
-    require_priced(dispatchable)
+    warn_unpriced(dispatchable)
     stopped, halted = None, None
     ctx = RunContext(a=a, state_map=state_map, pr_state=pr_state,
                      reply_text=reply_text, base_context=base_context,
@@ -1161,6 +1127,7 @@ def main():
         return
     threads_dir = pathlib.Path(a.threads_dir) if a.threads_dir else (outdir / "threads")
     plan = {"head_sha": head, "round": round_num,
+            "review_error": any(states[r] == "error" for r in ran),
             "scoreboard_comment_id": pr_state.get("scoreboard_comment_id"),
             "scoreboard_body": str(sb_path),
             "threads": render_thread_plan(
@@ -1182,7 +1149,7 @@ def main():
 
     # Budget signal: a PR that has been through its full review budget without going green is "spent".
     # A separate trusted step turns this into the review-budget-spent label, and the library's
-    # housekeeping CI closes spent PRs. Written on real review rounds only (init / daily-cap returned
+    # housekeeping CI closes spent PRs. Written on real review rounds only (init returned
     # earlier), so the label reconciles to current review state every time a PR is actually reviewed.
     # Count only full review passes: a reply re-runs a single contested rubric, so an author's back-
     # and-forth must not burn the budget, and a round cut short by the daily dollar budget (`stopped`)
