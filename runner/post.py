@@ -19,7 +19,7 @@ sidecar (records/posts/). A required thread failure withholds the scoreboard and
 scoreboard failure leaves the write-ahead markers pending and also exits nonzero. Thus a visible
 current-head scoreboard never names a blocker that lacks its contestable inline thread.
 """
-import argparse, datetime, hashlib, json, os, pathlib, re, subprocess, sys
+import argparse, datetime, hashlib, json, os, pathlib, random, re, shutil, subprocess, sys, time
 
 import archive
 
@@ -85,7 +85,7 @@ def find_review_roots(repo, pr):
             "rubric": rubric_match.group(1) if rubric_match else None,
             "head_sha": meta.get("head_sha") or c.get("commit_id"),
             "run_ids": [run.get("id") for run in (meta.get("runs") or []) if run.get("id")],
-            "created_at": c.get("created_at") or "",
+            "created_at": c.get("created_at") or "", "body": body,
         })
     return roots
 
@@ -186,23 +186,83 @@ def already_replied(repo, pr, rubric, through_id, me):
     return False
 
 
+def github_error_response(stdout):
+    """Retain GitHub's validation explanation, without request bodies or credentials."""
+    try:
+        payload = json.loads(stdout)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    detail = {k: payload[k] for k in ("message", "errors", "documentation_url", "status")
+              if k in payload}
+    if not detail:
+        return None
+    encoded = json.dumps(detail, ensure_ascii=True)
+    for name in ("GH_TOKEN", "GITHUB_TOKEN"):
+        token = os.environ.get(name)
+        if token:
+            encoded = encoded.replace(json.dumps(token)[1:-1], "[REDACTED]")
+    return json.loads(encoded)
+
+
 def gh_api(method, endpoint, fields=None, body_file=None, failures=None, action=""):
     cmd = ["gh", "api", "-X", method, endpoint]
     if body_file:
         cmd += ["-F", f"body=@{body_file}"]  # @file -> read body from the rendered markdown
     for k, v in (fields or {}).items():
         cmd += ["-f", f"{k}={v}"]
-    r = subprocess.run(cmd, text=True, capture_output=True)
-    if r.returncode != 0:
+    comment_send = bool(body_file and method in ("POST", "PATCH"))
+    shared_pacing = bool(os.environ.get("TAUCETI_GITHUB_SHARED_PACING")) and os.environ["TAUCETI_GITHUB_SHARED_PACING"] == shutil.which("gh")
+    if comment_send:
+        cmd.append("--include")  # Keep Retry-After alongside GitHub's error JSON.
+        # Space comment sends to guard against GitHub 422 spam/too-quickly rejections.
+        if not shared_pacing:
+            time.sleep(2)
+    for attempt in range(4):
+        r = subprocess.run(cmd, text=True, capture_output=True)
+        body, headers, status = r.stdout, {}, None
+        # gh --include prefixes the JSON body with HTTP headers. subprocess normalizes newlines.
+        while body.startswith("HTTP/"):
+            block, separator, body = body.partition("\n\n")
+            if not separator:
+                break
+            status = block.splitlines()[0].split()[1]
+            headers = {k.strip().lower(): v.strip() for line in block.splitlines()[1:]
+                       if ":" in line for k, v in [line.split(":", 1)]}
+        if r.returncode == 0:
+            try:
+                return json.loads(body)
+            except Exception:
+                return {}
         print(f"gh api {method} {endpoint} FAILED: {r.stderr[-600:]}", file=sys.stderr)
+        detail = github_error_response(body)
+        if detail:
+            print("GitHub error JSON: " + json.dumps(detail, ensure_ascii=True), file=sys.stderr)
+        too_quickly = (comment_send and str(status or (detail or {}).get("status")) == "422"
+                       and any(isinstance(e, dict)
+                               and (e.get("resource") == "PullRequestReviewComment"
+                                    and e.get("message") == "was submitted too quickly"
+                                    or e.get("resource") in ("PullRequestReview", "PullRequestReviewComment")
+                                    and e.get("code") == "abuse")
+                               for e in ((detail or {}).get("errors") or [])))
+        if too_quickly and attempt < 3 and not shared_pacing:
+            # Retry this rejected publication, never the model. Other 422 validation errors
+            # need fixing, not retries. GitHub recommends at least a minute after throttling.
+            try:
+                retry_after = float(headers.get("retry-after", "0"))
+            except ValueError:
+                retry_after = 0
+            delay = max(60 * 2 ** attempt, retry_after) + random.uniform(0, 5)
+            print(f"Comment throttled (HTTP 422); retry {attempt + 1}/3 in {delay:.1f}s",
+                  file=sys.stderr)
+            time.sleep(delay)
+            continue
         if failures is not None:
             failures.append({"action": action or f"{method} {endpoint}",
-                             "error": r.stderr[-300:]})
+                             "error": r.stderr[-300:],
+                             **({"response": detail} if detail else {})})
         return None
-    try:
-        return json.loads(r.stdout)
-    except Exception:
-        return {}
 
 
 SCOREBOARD_MARKER = "<!--tauceti-scoreboard-->"
@@ -219,7 +279,7 @@ def current_login():
 
 
 def find_scoreboard_comments(repo, pr):
-    """Return every marked scoreboard as {id, login, updated_at}, newest first.
+    """Return every marked scoreboard as {id, login, updated_at, body}, newest first.
 
     This is the ownership proof before `upsert_scoreboard` mutates a known comment, so it deliberately
     includes outside contributors: author association does not change whether a comment is ours.
@@ -229,7 +289,7 @@ def find_scoreboard_comments(repo, pr):
     r = subprocess.run(
         ["gh", "api", "--paginate", f"/repos/{repo}/issues/{pr}/comments?per_page=100", "--jq",
          '.[] | select((.body // "") | contains("' + SCOREBOARD_MARKER + '")) '
-         '| {id, login: (.user.login // ""), updated_at: (.updated_at // "")} | @json'],
+         '| {id, login: (.user.login // ""), updated_at: (.updated_at // ""), body} | @json'],
         text=True, capture_output=True)
     if r.returncode != 0:
         print(f"scoreboard lookup failed: {r.stderr[-300:]}", file=sys.stderr)
@@ -260,7 +320,10 @@ def upsert_scoreboard(repo, pr, body_file, plan_sb_id, pr_state, failures, mine=
     scoreboard. A foreign or missing known id is never PATCHed, and a new scoreboard is posted only
     when this identity has none to reuse. Discovery is required: on failure, mutate nothing and let
     the publication retry. A failed edit of our own comment is likewise a real error, never silently
-    re-posted. Returns (sb_id, ok). `mine` overrides the actor login."""
+    re-posted. Identical text needs no PATCH only when this comment is strictly
+    newest: updated_at determines which scoreboard supersedes others. Our
+    obsolete duplicates are still removed. Returns (sb_id, ok). `mine` overrides
+    the actor login."""
     me = mine if mine is not None else current_login()
     existing = find_scoreboard_comments(repo, pr)
     if existing is None:
@@ -282,7 +345,14 @@ def upsert_scoreboard(repo, pr, body_file, plan_sb_id, pr_state, failures, mine=
 
     ok = False
     if sb_id:
-        if gh_api("PATCH", f"/repos/{repo}/issues/comments/{sb_id}", body_file=body_file,
+        current = next(c for c in ours if c["id"] == sb_id)
+        strictly_newest = all(c.get("updated_at") and current.get("updated_at")
+                             and c["updated_at"] < current["updated_at"]
+                             for c in existing if c["id"] != sb_id)
+        if strictly_newest and current.get("body") == pathlib.Path(body_file).read_text():
+            pr_state["scoreboard_comment_id"] = sb_id
+            ok = True
+        elif gh_api("PATCH", f"/repos/{repo}/issues/comments/{sb_id}", body_file=body_file,
                   failures=failures, action="scoreboard PATCH") is not None:
             pr_state["scoreboard_comment_id"] = sb_id
             ok = True
@@ -348,6 +418,8 @@ def archive_outcome(archive_dir, repo, pr, plan, sb_id, scoreboard_ok, posted_th
 
 def execute_post(repo, pr, plan, ledger_path, archive_dir=""):
     """Execute one trusted plan. Return a process-style status code (0 success, 1 incomplete)."""
+    if plan.get("review_changed") is False:
+        return 0
     head = plan.get("head_sha", "")
     ledger_path = pathlib.Path(ledger_path)
     ledger = json.loads(ledger_path.read_text())
@@ -397,7 +469,12 @@ def execute_post(repo, pr, plan, ledger_path, archive_dir=""):
               f"{len(failures)} failure(s); publication remains pending.")
         return 1
 
-    pr_state["published_head_sha"] = head
+    if plan.get("in_progress"):
+        # The visible board no longer represents a completed review. A same-head
+        # Actions rerun must restore it even when no reviewer needs to run again.
+        pr_state.pop("published_head_sha", None)
+    else:
+        pr_state["published_head_sha"] = head
     if pr_state.get("pending_publication_head_sha") == head:
         pr_state.pop("pending_publication_head_sha", None)
     for t in required:
@@ -429,8 +506,9 @@ def execute_post(repo, pr, plan, ledger_path, archive_dir=""):
         root = roots_by_id.get(cid)
         if not cid or not root or root.get("login") != me:
             continue  # nothing of ours to edit; never cross-edit another identity's thread
-        if gh_api("PATCH", f"/repos/{repo}/pulls/comments/{cid}", body_file=t["body"],
-                  failures=failures, action=f"thread close {rubric}") is not None:
+        if (root.get("body") == pathlib.Path(t["body"]).read_text()
+                or gh_api("PATCH", f"/repos/{repo}/pulls/comments/{cid}", body_file=t["body"],
+                          failures=failures, action=f"thread close {rubric}") is not None):
             posted_threads[rubric] = cid
             resolve_thread(repo, pr, cid)
 

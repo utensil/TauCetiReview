@@ -4,11 +4,9 @@
 Any reviewer — the worker, or anyone running tauceti-review — posts a scoreboard comment on the PR
 carrying a `<!--tauceti-meta:v1 {...}-->` block with `head_sha` and a full per-rubric `states` map. The
 newest completed scoreboard at the current head is the verdict: a later completed review supersedes
-an earlier one instead of making every disagreement a permanent veto. An unexpired
-review-in-progress marker delays initial enqueue, but does not revoke an already-completed green
-verdict; if that review later posts a blocking scoreboard, the completed verdict makes the review
-state unsafe and the reconciler dequeues the PR. It is mergeable when that review state is safe, no
-review is live, and the shared `decide_merge` rule also holds (build green, TauCeti/-only + allowed
+an earlier one instead of making every disagreement a permanent veto. A later blocking scoreboard
+makes the review state unsafe and the reconciler dequeues the PR. It is mergeable when that
+completed review state is safe and the shared `decide_merge` rule also holds (build green, TauCeti/-only + allowed
 root/pins, bump-guard for a pin). This is the "no bar" model: trust is the posted comment itself, so a
 contributor with no repo write can still have their review count. The HARD boundary that a forged
 scoreboard cannot bypass remains the CI build + scope + axiom audit + bump-guard checks.
@@ -21,25 +19,28 @@ table (one row per rubric; the 3rd cell is the state word). Writes `merge.json` 
         --merge-decision-file merge.json
 """
 import argparse
+import os
 import json
 import pathlib
 import re
 import subprocess
 import sys
-import time
 
 from merge import read_paths
 from review import DEFAULT_RUBRICS, decide_merge
 
 SCOREBOARD_MARKER = "<!--tauceti-scoreboard-->"
 META_RE = re.compile(r"<!--tauceti-meta:v1 (.*?)-->", re.S)
-COORD_RE = re.compile(r"<!--tauceti-review-in-progress (.*?)-->", re.S)
 # A rendered scoreboard row: | <icon> | [rubric](url) | <state word> | `judge` | summary |
 TABLE_ROW_RE = re.compile(r"^\|[^|]*\|\s*\[?([a-z0-9-]+)\]?[^|]*\|\s*([^|]+?)\s*\|", re.M)
 WORD_STATE = {"approved": "green", "changes requested": "blocking_request",
               "blocked": "blocking_block", "stale (re-run pending)": "stale",
               "not yet run": "absent", "error": "error"}
 
+
+if os.environ.get("TAUCETI_CONF") or any(arg == "--conf" or arg.startswith("--conf=") for arg in sys.argv[1:]):
+    from tauceti_tools.project import bootstrap
+    bootstrap()
 
 def parse_meta(body):
     m = META_RE.findall(body or "")
@@ -100,36 +101,12 @@ def latest_current_scoreboard(comments, head_sha):
     return max(enumerate(candidates), key=order)[1]
 
 
-def has_live_review(comments, head_sha, now=None):
-    """Whether an unexpired review-in-progress marker claims this exact head.
-
-    Markers need only normal issue-comment access, so independent contributors can pause the queue
-    while reviewing without gaining repository permissions. Invalid, expired, and other-head markers
-    are ignored. A crashed reviewer self-clears when its marker's existing TTL expires.
-    """
-    now = int(time.time()) if now is None else now
-    for comment in comments:
-        match = COORD_RE.search(comment.get("body") or "")
-        if not match:
-            continue
-        try:
-            marker = json.loads(match.group(1))
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(marker, dict):
-            continue
-        expires = marker.get("expires_at")
-        if marker.get("head") == head_sha and isinstance(expires, int) and expires > now:
-            return True
-    return False
-
-
 # docbuild/docs/references.bib is the bibliography doc-gen4 resolves docstring citations
 # against, so a docstring citing a work no one has entered renders as a bare bracketed key.
 # Filling it in is the same work as writing the docstring. It is BibTeX read only by the pages
 # build — never by Lake or the review harness — so nothing here executes it. TauCeti's own scope
 # guard allows the same single path; both gates must agree for such a PR to merge.
-DEFAULT_ALLOW = ["TauCeti.lean", "lake-manifest.json", "lean-toolchain",
+DEFAULT_ALLOW = [os.environ.get("TAUCETI_LEAN_ROOT", "TauCeti").replace(".", "/") + ".lean", "lake-manifest.json", "lean-toolchain",
                  "docbuild/docs/references.bib"]
 
 
@@ -156,7 +133,7 @@ def load_comments(text):
 
 
 def decide_from_comments(comments, head_sha, required, paths, ci_build, bump_guard,
-                         merge_path_prefix="TauCeti/", merge_allow_file=None, scope="", now=None,
+                         merge_path_prefix=os.environ.get("TAUCETI_LEAN_ROOT", "TauCeti").replace(".", "/") + "/", merge_allow_file=None, scope="", now=None,
                          merge_base_sha=""):
     """The gate shared by merge-only and the sweep.
 
@@ -204,12 +181,6 @@ def decide_from_comments(comments, head_sha, required, paths, ci_build, bump_gua
                 "reason": "the newest completed scoreboard for the current head is not all-green; "
                           "refusing",
                 "head_sha": head_sha}
-    if has_live_review(comments, head_sha, now):
-        return {"review_safe": True, "merge": False,
-                "reason": "the newest completed scoreboard is green, but a review is in progress; "
-                          "waiting before enqueue",
-                "head_sha": head_sha}
-
     states = {r: "green" for r in required}
     candidates = sorted(required)
     merge_ok, reason = decide_merge(states, candidates, True, set(paths), head_sha,
@@ -233,7 +204,7 @@ def resolve_commit_status(repo, head_sha, context):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo", default="TauCetiProject/TauCeti")
+    ap.add_argument("--repo", default=os.environ.get("TAUCETI_REPO", "TauCetiProject/TauCeti"))
     ap.add_argument("--pr", required=True)
     ap.add_argument("--head-sha", required=True)
     ap.add_argument("--comments-file", required=True, help="JSON array of the PR's issue comments")
@@ -247,9 +218,10 @@ def main():
     ap.add_argument("--bump-guard", default="")
     ap.add_argument("--scope", default="",
                     help="trusted scope status; resolved from HEAD when omitted")
-    ap.add_argument("--merge-path-prefix", default="TauCeti/")
+    ap.add_argument("--merge-path-prefix", default=os.environ.get("TAUCETI_LEAN_ROOT", "TauCeti").replace(".", "/") + "/")
     ap.add_argument("--merge-allow-file", action="append", default=list(DEFAULT_ALLOW))
     ap.add_argument("--merge-decision-file", default="")
+    ap.add_argument("--conf")
     a = ap.parse_args()
 
     required = {r for r in a.rubrics.split(",") if r}

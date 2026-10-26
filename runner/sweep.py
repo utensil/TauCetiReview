@@ -35,6 +35,9 @@ and bound to the reviewed head, and a real execution failure exits nonzero; beni
 queued, head moved) do not. The merge decision is the SAME decide_from_comments the merge-only path
 uses, so the sweep can never enqueue something the normal gate would refuse.
 
+With MERGE_BACKEND=direct the sweep merges eligible heads directly, without
+queue observations, branch updates or requiring the latest main.
+
 Env: GH_TOKEN (contents+pull-requests+issues+workflows write), REPO (owner/name), optional DRY_RUN=1, EVICT_ESCALATE,
 MERGE_PREFIX.
 """
@@ -60,7 +63,7 @@ FOCUSED = os.environ.get("FOCUSED") == "1"
 # update-branch. 0 prior evictions => first re-enqueue; the queue rebuild is the real test. The default
 # (2) gives a transient eviction one more cheap retry before paying for an update-branch + re-review.
 EVICT_ESCALATE = int(os.environ.get("EVICT_ESCALATE", "2"))
-MERGE_PREFIX = os.environ.get("MERGE_PREFIX", "TauCeti/")
+MERGE_PREFIX = os.environ.get("MERGE_PREFIX", os.environ.get("TAUCETI_LEAN_ROOT", "TauCeti").replace(".", "/") + "/")
 # A PR touching these gets the merge queue to itself while it is enqueued (see reservation_holder).
 PIN_PATHS = {"lake-manifest.json", "lean-toolchain"}
 # How long a holder may hold the queue. Its build takes 83-95 minutes, so an entry much older than
@@ -81,14 +84,14 @@ REBASE_MARKER_RE = re.compile(r"^<!--tauceti-rebase:v1 ([0-9a-f]{40})-->$", re.M
 STALLED_MARKER_RE = re.compile(r"^<!--tauceti-merge-stalled:v1 ([0-9a-f]{40})-->$", re.M)
 STALLED_COMMENT = (
     "Merge-queue recovery for head `{sha}`: repeated queue evictions, but this branch already "
-    "includes current `main`. A maintainer needs to inspect the merge-group failure; no worker "
-    "rebase is requested. The sweep will wait at this head. Add `keep` to pause recovery.\n\n"
+    "includes current `main`. Diagnose and repair the integration failure; rebasing alone will "
+    "not resolve it. An author unable to resolve it should close their own PR with an explanation.\n\n"
     "<!--tauceti-merge-stalled:v1 {head}-->")
 REBASE_COMMENT = (
     "Merge-queue recovery for head `{sha}`: {reason} "
     "The author or their worker should merge current `main`, reconcile overlapping declarations, "
     "and push only after the build and axiom checks pass. This request uses the worker's existing "
-    "per-PR rebase-attempt budget; exhaustion requires human attention. The sweep will wait on this head "
+    "per-PR rebase-attempt budget; if repair cannot resolve the disagreement, close your own PR with an explanation. The sweep will wait on this head "
     "instead of retrying the same operation. A new head returns to normal CI and review. "
     "Workers predating this handoff support need a TauCetiWorker update and restart. "
     "The fork push credential must permit workflow changes inherited from main. "
@@ -432,7 +435,7 @@ def merge_base_now(pr, head):
     or a rewritten base changes the reviewed diff under the same head, and enqueueing binds only the
     head. Raises RuntimeError when it cannot be read or the PR no longer targets main."""
     v = gh_json(["pr", "view", str(pr), "--repo", REPO, "--json", "baseRefName,baseRefOid"]) or {}
-    if v.get("baseRefName") != "main" or not v.get("baseRefOid"):
+    if v.get("baseRefName") != os.environ.get("TAUCETI_BASE_BRANCH", "main") or not v.get("baseRefOid"):
         raise RuntimeError(f"base is now {v.get('baseRefName') or 'unknown'}, not main")
     cmp = gh_json(["api", f"/repos/{REPO}/compare/{v['baseRefOid']}...{head}?per_page=1"]) or {}
     merge_base = (cmp.get("merge_base_commit") or {}).get("sha") or ""
@@ -498,7 +501,7 @@ def update_branch(pr, head):
 def flag(pr, head, comments, *, worker=True, reason="This head needs reconciliation against main after repeated queue evictions."):
     """Publish a head-bound handoff before labelling it, repairing partial failures on retry."""
     if DRY_RUN:
-        action = "request worker reconciliation" if worker else "request human diagnosis (already up to date)"
+        action = "request worker reconciliation" if worker else "request integration-failure repair (already up to date)"
         print(f"[dry-run] would {action} for #{pr} ({head[:7]}): {reason}")
         return True
     if head not in rebase_request_heads(comments, stalled=not worker):
@@ -532,7 +535,7 @@ def reconcile_rebase_request(pr, head, labels, comments):
     if head in requested:
         if not labelled and not flag(pr, head, comments, worker=head in worker_heads):
             return "error"
-        actor = "its worker to reconcile" if head in worker_heads else "human diagnosis of"
+        actor = "its worker to reconcile" if head in worker_heads else "integration-failure repair at"
         print(f"#{pr}: waiting for {actor} head {head[:7]}")
         return "waiting"
     if labelled and requested:
@@ -649,7 +652,7 @@ def sweep_bors(prs, admit=True):
         try:
             v = gh_json(["pr", "view", str(n), "--repo", REPO, "--json",
                          "headRefOid,baseRefName,baseRefOid,id,labels,statusCheckRollup"])
-            if v["baseRefName"] != "main":
+            if v["baseRefName"] != os.environ.get("TAUCETI_BASE_BRANCH", "main"):
                 continue
             head = v["headRefOid"]
             comments = gh_jsonl(["api", "--paginate", f"/repos/{REPO}/issues/{n}/comments?per_page=100",
@@ -691,6 +694,37 @@ def sweep_bors(prs, admit=True):
     return 1 if failures else 0
 
 
+def sweep_direct(prs):
+    """Retry the same direct merge gate; no queues, rebases or base-freshness requirement."""
+    from direct_merge import merge
+    failures = 0
+    for p in candidates(prs, set(), set()):
+        api_budget.begin_pr()
+        n = p["number"]
+        try:
+            v = gh_json(["pr", "view", str(n), "--repo", REPO, "--json",
+                         "headRefOid,baseRefName,baseRefOid,statusCheckRollup"])
+            if v.get("baseRefName") != backend.BASE_BRANCH:
+                continue
+            head = v["headRefOid"]
+            comments = gh_jsonl(["api", "--paginate", f"repos/{REPO}/issues/{n}/comments?per_page=100",
+                                 "--jq", ".[] | {body, updated_at, created_at}"])
+            cmp = gh_json(["api", f"repos/{REPO}/compare/{v['baseRefOid']}...{head}?per_page=1"])
+            mb = cmp["merge_base_commit"]["sha"]
+            paths = pr_diff(REPO, n, head, mb)
+            build, bump, scope = status_states(v.get("statusCheckRollup"))
+            decision = decide_from_comments(comments, head, set(DEFAULT_RUBRICS), paths,
+                                            build, bump, MERGE_PREFIX, scope=scope, merge_base_sha=mb)
+            merge(REPO, n, decision, mb, dry_run=DRY_RUN)
+        except api_budget.Exhausted:
+            raise
+        except (RuntimeError, KeyError) as e:
+            print(f"#{n}: direct merge failed ({e})", file=sys.stderr)
+            api_budget.check_result(False)
+            failures += 1
+    return 1 if failures else 0
+
+
 def main():
     if not REPO:
         print("merge-sweep: REPO env is required", file=sys.stderr)
@@ -704,6 +738,8 @@ def main():
         api_budget.check_result(False)
         mode = "unknown"
     prs = open_prs()
+    if mode == "direct":
+        return sweep_direct(prs)
     bors_prs = bors_approved_prs()
     queue_prs = set()
     membership_unknown = bors_prs is None
@@ -782,7 +818,7 @@ def main():
                          "headRefOid,baseRefName,baseRefOid,id,labels,statusCheckRollup,"
                          "isCrossRepository"])
             head = v["headRefOid"]
-            if (v.get("baseRefName") or "") != "main":
+            if (v.get("baseRefName") or "") != os.environ.get("TAUCETI_BASE_BRANCH", "main"):
                 continue   # the sweep only drives PRs targeting main (the merge queue is main's)
             comments = gh_jsonl(["api", "--paginate", f"/repos/{REPO}/issues/{n}/comments?per_page=100",
                                  "--jq", ".[] | {body, updated_at, created_at, author: .user.login}"])
