@@ -48,14 +48,54 @@ def run(fake, existing, pr_state, plan_sb_id=None, mine="bot"):
     post.find_scoreboard_comments = lambda repo, pr: None if existing is None else list(existing)
     failures = []
     try:
-        sb_id, ok = post.upsert_scoreboard("o/r", 1, "body.md", plan_sb_id, pr_state, failures,
-                                           mine=mine)
+        with tempfile.TemporaryDirectory() as directory:
+            body = pathlib.Path(directory) / "body.md"
+            body.write_text("scoreboard body\n")
+            sb_id, ok = post.upsert_scoreboard("o/r", 1, body, plan_sb_id, pr_state, failures,
+                                               mine=mine)
     finally:
         post.gh_api, post.find_scoreboard_comments = saved_gh, saved_find  # don't leak into other tests
     return sb_id, ok, failures
 
 
 # --- upsert_scoreboard --------------------------------------------------------------------------
+
+def test_identical_scoreboard_is_success_without_writes():
+    fake, state = FakeGH(), {}
+    sb_id, ok, failures = run(fake, existing=[{
+        "id": 200, "login": "bot", "body": "scoreboard body\n"}], pr_state=state)
+    assert ok and sb_id == 200 and state["scoreboard_comment_id"] == 200
+    assert not fake.calls and not failures
+
+
+def test_identical_scoreboard_still_removes_only_our_obsolete_duplicates():
+    fake = FakeGH()
+    sb_id, ok, failures = run(fake, existing=[
+        {"id": 200, "login": "bot", "body": "scoreboard body\n", "updated_at": "2026-10-19T08:00:00Z"},
+        {"id": 100, "login": "bot", "body": "old", "updated_at": "2026-10-19T07:00:00Z"},
+        {"id": 50, "login": "someone-else", "body": "old", "updated_at": "2026-10-19T06:00:00Z"}], pr_state={})
+    assert ok and sb_id == 200 and not failures
+    assert fake.calls == [("DELETE", "/repos/o/r/issues/comments/100")]
+
+
+def test_identical_foreign_scoreboard_does_not_count_as_our_publication():
+    fake = FakeGH(post_id=300)
+    sb_id, ok, failures = run(fake, existing=[{
+        "id": 200, "login": "someone-else", "body": "scoreboard body\n"}], pr_state={})
+    assert ok and sb_id == 300 and not failures
+    assert fake.calls == [("POST", "/repos/o/r/issues/1/comments")]
+
+
+def test_identical_board_refreshes_if_another_board_is_newer_or_tied():
+    for other_time in ('2026-10-19T08:01:00Z', '2026-10-19T08:00:00Z', None):
+        fake = FakeGH()
+        existing = [
+            {"id": 300, "login": "someone-else", "body": "other", "updated_at": other_time},
+            {"id": 200, "login": "bot", "body": "scoreboard body\n", "updated_at": "2026-10-19T08:00:00Z"}]
+        sb_id, ok, failures = run(fake, existing, {}, plan_sb_id=200)
+        assert ok and sb_id == 200 and not failures
+        assert fake.calls == [("PATCH", "/repos/o/r/issues/comments/200")]
+
 
 def test_known_id_edits_in_place():
     fake = FakeGH(patch_ok=True)
@@ -230,7 +270,7 @@ def test_find_review_roots_extracts_identity_head_and_run():
         post.subprocess.run = orig
     assert roots == [{"id": 7, "node_id": "N7", "path": "x.lean", "login": "bot",
                       "rubric": "api-design", "head_sha": "abc", "run_ids": ["r-1"],
-                      "created_at": "2026-08-04T00:00:00Z"}], roots
+                      "created_at": "2026-08-04T00:00:00Z", "body": body}], roots
 
 
 # --- transactional publication -----------------------------------------------------------------
@@ -305,6 +345,18 @@ def test_required_root_precedes_scoreboard_and_commits_markers():
     cf = pr["state"]["api-design"]
     assert cf["thread"]["comment_id"] == 700
     assert "pending_thread_run_id" not in cf
+
+
+def test_identical_scoreboard_commits_the_publication_without_a_patch():
+    fake = TransactionGH()
+    status, ledger = _execute(fake, [], scoreboards=[{
+        "id": 500, "login": "bot", "body": "scoreboard"}])
+    assert status == 0
+    assert fake.calls == [("POST", "/repos/o/r/pulls/1/comments")]
+    pr = ledger["prs"]["1"]
+    assert pr["published_head_sha"] == "h" * 40
+    assert "pending_publication_head_sha" not in pr
+    assert "pending_thread_run_id" not in pr["state"]["api-design"]
 
 
 def test_required_failure_withholds_scoreboard_and_keeps_pending():
@@ -405,6 +457,163 @@ def test_optional_close_failure_does_not_roll_back_publication():
          post.find_scoreboard_comments) = saved
     assert status == 0
     assert fake.calls[-1] == ("PATCH", "/repos/o/r/pulls/comments/80"), fake.calls
+
+
+
+def test_identical_closed_body_skips_patch_but_resolves_thread():
+    ledger_path, plan = _post_fixture()
+    close_body = ledger_path.parent / "close.md"; close_body.write_text("close")
+    plan["threads"].append({"rubric": "reuse", "action": "close", "required": False,
+                            "body": str(close_body), "comment_id": 80})
+    ledger = json.loads(ledger_path.read_text())
+    ledger["prs"]["1"]["state"]["reuse"] = {"thread": {"comment_id": 80}}
+    ledger_path.write_text(json.dumps(ledger))
+    roots = [{"id": 80, "node_id": "N80", "path": "x.lean", "login": "bot",
+              "rubric": "reuse", "head_sha": "g" * 40, "run_ids": ["r-old"],
+              "created_at": "2026-08-03T00:00:00Z", "body": "close"}]
+
+    class OptionalFailureGH(TransactionGH):
+        def __call__(self, method, endpoint, fields=None, body_file=None, failures=None, action=""):
+            if endpoint.endswith("/pulls/comments/80"):
+                self.calls.append((method, endpoint))
+                failures.append({"action": action, "error": "injected optional failure"})
+                return None
+            return super().__call__(method, endpoint, fields, body_file, failures, action)
+
+    fake = OptionalFailureGH()
+    saved = (post.gh_api, post.find_review_roots, post.current_login,
+             post.find_scoreboard_comments, post.resolve_thread)
+    post.gh_api = fake
+    post.find_review_roots = lambda repo, pr: roots
+    post.current_login = lambda: "bot"
+    post.find_scoreboard_comments = lambda repo, pr: []
+    resolved = []
+    post.resolve_thread = lambda repo, pr, cid: resolved.append(cid)
+    try:
+        status = post.execute_post("o/r", 1, plan, ledger_path)
+    finally:
+        (post.gh_api, post.find_review_roots, post.current_login,
+         post.find_scoreboard_comments, post.resolve_thread) = saved
+    assert status == 0
+    assert ("PATCH", "/repos/o/r/pulls/comments/80") not in fake.calls
+    assert resolved == [80]
+
+
+def test_validation_json_is_logged_and_retained_without_credentials():
+    import contextlib, io, json
+    from unittest.mock import patch
+    payload = {"message": "Validation Failed", "errors": [
+        {"resource": "PullRequestReviewComment", "code": "custom",
+         "message": "was submitted too quickly: diagnostic-token"}],
+        "status": "422", "documentation_url": "https://docs.github.com/rest",
+        "request_body": "must not be logged"}
+    failures, stderr = [], io.StringIO()
+    result = types.SimpleNamespace(returncode=1, stdout=json.dumps(payload),
+                                   stderr="gh: Validation Failed (HTTP 422)")
+    with (patch.object(post.subprocess, "run", return_value=result),
+          patch.dict(post.os.environ, GH_TOKEN="diagnostic-token"),
+          contextlib.redirect_stderr(stderr)):
+        assert post.gh_api("POST", "/repos/o/r/pulls/1/comments", failures=failures) is None
+    detail = failures[0]["response"]
+    assert detail["status"] == "422"
+    assert detail["errors"][0]["message"] == "was submitted too quickly: [REDACTED]"
+    assert "GitHub error JSON:" in stderr.getvalue()
+    assert "diagnostic-token" not in stderr.getvalue()
+    assert "must not be logged" not in stderr.getvalue()
+    assert "request_body" not in detail
+
+
+def test_non_json_error_response_keeps_original_failure():
+    from unittest.mock import patch
+    result = types.SimpleNamespace(returncode=1, stdout="<html>gateway failure</html>",
+                                   stderr="gh: HTTP 502")
+    failures = []
+    with patch.object(post.subprocess, "run", return_value=result):
+        assert post.gh_api("POST", "/repos/o/r/pulls/1/comments", failures=failures) is None
+    assert failures == [{"action": "POST /repos/o/r/pulls/1/comments", "error": "gh: HTTP 502"}]
+
+
+def _throttled_comment(headers="", message="was submitted too quickly"):
+    return types.SimpleNamespace(returncode=1, stderr="gh: Validation Failed (HTTP 422)",
+        stdout="HTTP/2.0 422 Unprocessable Entity\n" + headers + "\n" + json.dumps({
+            "message": "Validation Failed", "errors": [{
+                "resource": "PullRequestReviewComment", "message": message}]}))
+
+
+def test_throttled_comment_retries_same_request_and_returns_confirmed_id():
+    from unittest.mock import patch
+    success = types.SimpleNamespace(returncode=0, stderr="",
+        stdout='HTTP/2.0 201 Created\nContent-Type: application/json\n\n{"id":123}')
+    failures = []
+    with (patch.object(post.subprocess, "run", side_effect=[_throttled_comment(), success]) as gh,
+          patch.object(post.time, "sleep") as sleep,
+          patch.object(post.random, "uniform", return_value=3)):
+        assert post.gh_api("POST", "/repos/o/r/pulls/1/comments", body_file="body.md",
+                           failures=failures) == {"id": 123}
+    assert not failures
+    assert [call.args[0] for call in sleep.call_args_list] == [2, 63]
+    assert gh.call_count == 2 and gh.call_args_list[0] == gh.call_args_list[1]
+    assert "--include" in gh.call_args.args[0]
+
+
+def test_comment_throttle_doubles_waits_and_exhaustion_retains_failure():
+    from unittest.mock import patch
+    failures = []
+    with (patch.object(post.subprocess, "run", return_value=_throttled_comment()) as gh,
+          patch.object(post.time, "sleep") as sleep,
+          patch.object(post.random, "uniform", return_value=0)):
+        assert post.gh_api("PATCH", "/repos/o/r/pulls/comments/123", body_file="body.md",
+                           failures=failures, action="required thread PATCH naming") is None
+    assert gh.call_count == 4
+    assert [call.args[0] for call in sleep.call_args_list] == [2, 60, 120, 240]
+    assert len(failures) == 1
+    assert failures[0]["action"] == "required thread PATCH naming"
+    assert failures[0]["response"]["errors"][0]["message"] == "was submitted too quickly"
+
+
+def test_comment_throttle_honors_retry_after():
+    from unittest.mock import patch
+    success = types.SimpleNamespace(returncode=0, stdout='{"id":123}', stderr="")
+    with (patch.object(post.subprocess, "run", side_effect=[
+              _throttled_comment("Retry-After: 180\n"), success]),
+          patch.object(post.time, "sleep") as sleep,
+          patch.object(post.random, "uniform", return_value=0)):
+        assert post.gh_api("POST", "/repos/o/r/pulls/1/comments", body_file="body.md") == {"id":123}
+    assert [call.args[0] for call in sleep.call_args_list] == [2, 180]
+
+
+def test_other_validation_errors_are_not_retried():
+    from unittest.mock import patch
+    failures = []
+    with (patch.object(post.subprocess, "run", return_value=_throttled_comment(
+              message="path is not part of the diff")) as gh,
+          patch.object(post.time, "sleep") as sleep):
+        assert post.gh_api("POST", "/repos/o/r/pulls/1/comments", body_file="body.md",
+                           failures=failures) is None
+    assert gh.call_count == 1 and sleep.call_args.args == (2,)
+    assert len(failures) == 1
+
+
+def test_abuse_response_retries_without_repeating_model():
+    from unittest.mock import patch
+    abuse = types.SimpleNamespace(returncode=1, stdout='HTTP/2.0 422 Unprocessable Entity\n\n' + json.dumps({"status":"422", "errors":[{"resource":"PullRequestReview", "code":"abuse", "field":"base"}]}), stderr='rejected')
+    success = types.SimpleNamespace(returncode=0, stdout='{"id":123}', stderr='')
+    with (patch.object(post.subprocess, 'run', side_effect=[abuse, success]) as gh,
+          patch.object(post.time, 'sleep') as sleep,
+          patch.object(post.random, 'uniform', return_value=0)):
+        assert post.gh_api('POST', '/repos/o/r/pulls/1/comments/2/replies', body_file='body.md') == {"id":123}
+        assert gh.call_count == 2
+        assert [c.args[0] for c in sleep.call_args_list] == [2, 60]
+
+
+def test_shared_transport_owns_pacing_and_retry_budget():
+    from unittest.mock import patch
+    with (patch.dict(post.os.environ, {"TAUCETI_GITHUB_SHARED_PACING":"/tmp/shared-gh"}),
+          patch.object(post.shutil, "which", return_value="/tmp/shared-gh"),
+          patch.object(post.subprocess, 'run', return_value=_throttled_comment()) as gh,
+          patch.object(post.time, 'sleep') as sleep):
+        assert post.gh_api('POST', '/repos/o/r/pulls/1/comments', body_file='body.md') is None
+        assert gh.call_count == 1 and not sleep.called
 
 
 if __name__ == "__main__":

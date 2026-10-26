@@ -127,7 +127,7 @@ Add `--post` to publish. Useful flags:
 | `--reviewer claude\|codex\|kiro\|sonnet\|deepseek\|minimax\|grok` | restrict to these reviewers (default: every auto-drawn one you have — `claude` and `codex`). Direct `claude` defaults to exact `claude-opus-5-5`; override with `--claude-model`. `kiro` is explicit-only and always uses the exact `--kiro-model`. `sonnet` is the `claude` CLI pinned to Sonnet. `deepseek`/`minimax`/`grok` run an OpenRouter model through the [`pi`](https://github.com/badlogic/pi-mono) agent and need `pi` on PATH + `OPENROUTER_API_KEY`. All but `claude`/`codex` are explicit-only (never auto-drawn) |
 | `--claude-model MODEL` | exact direct-Claude model ID, also configurable through `TAUCETI_CLAUDE_MODEL` for managed workers. The flag takes precedence. Unset: use the selected engine's default. A model with no entry in `runner/prices.json` still runs, billed at the newest rate on its own model line; its exact ID is recorded in review provenance |
 | `--kiro-model MODEL` | exact Kiro model ID; defaults to `gpt-5.6-sol`. Use `claude-opus-5` for Kiro's current Opus |
-| `--mode manual` | re-run every rubric. The default, `commit`, re-runs only rubrics that are blocking or not yet run, shows earlier approvals as ♻️ (stale), and re-runs those once nothing else blocks. Approvals from the PR's newest scoreboard, whoever posted it, count as ♻️ for rubrics your local store has no verdict for |
+| `--mode manual` | re-run every rubric. The default, `commit`, reuses a completed published review of the current head across workers. A new unanswered author contest reopens its rubric while retaining the other published decisions. Missing history still permits ordinary investigation. Incomplete or different-head reviews retain the existing stale-approval and review rules |
 | `--no-mathlib` | skip fetching pinned Mathlib source; `reuse`/`naming` can't grep Mathlib |
 | `--repo owner/name` | review a different repo (default `TauCetiProject/TauCeti`) |
 | `--auth api` | use the matching `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `KIRO_API_KEY` instead of a browser login |
@@ -149,6 +149,12 @@ Add `--post` to publish. Useful flags:
 4. Reads each verdict from a fresh one-time marker token, so nothing in the PR text can forge an
    `approve` (this anti-forgery channel is kept even though you are trusted).
 5. Prints the scoreboard + threads, and with `--post`, publishes them via `gh` as you.
+
+Comment publication keeps two-second spacing. GitHub's specific HTTP 422
+`was submitted too quickly` rejection retries the same comment after 60, 120, and 240 seconds,
+with up to five seconds of jitter and any longer `Retry-After` delay. Other validation errors
+are not retried. If publication still fails, the saved plan and confirmed comment IDs remain
+available for automatic publication repair without running the models again.
 
 The posted scoreboard is the live verdict consumed by auto-merge: both merge paths read the newest
 marked scoreboard and require it to name the current head. The engine also writes detailed records
@@ -178,17 +184,13 @@ gate and a contributor needs no TauCetiData write access for a posted review to 
   your real HOME and prints a note; pass `--auth api` with a key for a guaranteed clean room there.
 - **Determinism.** With both CLIs installed the reviewer is random per rubric, so two runs can
   differ on borderline rubrics — the same property the CI review has.
-- **Concurrent reviewers.** Before spending inference, a contributing run (one that posts or
-  archives) posts a short-lived `review in progress` comment scoped to the `head` alone and checks
-  for one already there. If another reviewer already holds the commit, this run skips it entirely —
-  so a commit is reviewed once regardless of model, and a fleet never pays twice. A *different* model
-  is not a distinct unit (the first claimer wins); only a new push, being a fresh head, is a fresh
-  unit. Simultaneous claimers wait five seconds for GitHub's comment replicas to settle, then the
-  lowest comment id wins. The marker self-expires (a crashed reviewer never blocks anyone) and is
-  deleted when done.
-  It needs only the ability to comment, so an independent reviewer with no repo write still
-  coordinates. Pass `--no-coordinate` for a private read-only pass that touches the PR not at all
-  (at the cost of possible duplicate spend); a `--shadow` arm opts out automatically.
+- **Concurrent reviewers.** Before spending inference, a contributing run acquires a renewable
+  Git lease for the repository, PR and exact head. Another holder makes the run yield without
+  inference (exit status 81), regardless of model. Leases release on exit and expire after crashes.
+  Set `CLAIM_REPO` to an accessible claims repository; otherwise existing shared access or a direct
+  personal fork is used. No repository is created automatically. Git outages allow work to proceed
+  with a warning about possible duplicates. `--no-coordinate` opts out; shadow runs opt out automatically.
+  Old review-in-progress comments are ignored and no longer published or deleted.
 
 ## Shadow reviews (A/B arms)
 
@@ -206,3 +208,23 @@ fresh (`--mode manual` semantics, scratch store, no carried-forward case files) 
 arms over the same `(PR, head, rubric)` are comparable; records land with `arm: shadow:<label>`
 and pair up with the production run in TauCetiData's `ab_pairs` view. In CI, the
 `shadow-review` workflow (manual dispatch) does the same with API keys and a per-run budget.
+
+### Publication traffic
+
+All rubric results, findings, contest answers and scoreboard metadata remain.
+For example, a publication repair that already set a finding's closed body used
+to PATCH that identical body again; it now skips that PATCH, while still resolving
+the thread if needed. Existing exact-root adoption, reply deduplication and
+scoreboard reuse remain in place. No per-rubric detail is removed.
+
+Standalone clients space comment sends and retry the specific captured
+422 anti-abuse responses with bounded exponential delay. Under an updated Worker
+transport, shared account-wide pacing and retry handling replace that local loop,
+so delays do not multiply. Newly created findings are still published individually;
+batched reviews are deferred because partial-response reconciliation would add a
+second publication protocol. Blocker roots still land before the scoreboard.
+
+The shared lease implementation is packaged in TauCetiTools. Operators using an
+explicit claim repository keep using `CLAIM_REPO`; otherwise the helper checks
+existing shared access and an existing direct fork. The worker passes its already
+resolved namespace, avoiding repeated access discovery in review subprocesses.

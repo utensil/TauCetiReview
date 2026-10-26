@@ -41,13 +41,18 @@ import uuid
 # this CLI drives the engine as a subprocess and never imports it (the engine's modules use flat
 # sibling imports and only resolve with runner/ on sys.path, which an installed `runner.cli` has no
 # reason to arrange). tests/test_provider_down.py pins the two definitions together.
-PROVIDER_DOWN_EXIT = 3
+if os.environ.get("TAUCETI_CONF") or any(arg == "--conf" or arg.startswith("--conf=") for arg in sys.argv[1:]):
+    from tauceti_tools.project import bootstrap
+    bootstrap()
 
-REVIEW_REPO = "TauCetiProject/TauCetiReview"
+PROVIDER_DOWN_EXIT = 3
+COORDINATED_ELSEWHERE_EXIT = 81
+
+REVIEW_REPO = os.environ.get("TAUCETI_REVIEW_REPO", "TauCetiProject/TauCetiReview")
+DEFAULT_CODE_REPO = os.environ.get("TAUCETI_REPO", "TauCetiProject/TauCeti")
+DEFAULT_ROADMAP_REPO = os.environ.get("TAUCETI_ROADMAP_REPO", "TauCetiProject/TauCetiRoadmap")
 RUBRIC_POLICY_REPO = "utensil/TauCetiReview"
 RUBRIC_POLICY_FILE = "rubric-deviations.json"
-DEFAULT_CODE_REPO = "TauCetiProject/TauCeti"
-DEFAULT_ROADMAP_REPO = "TauCetiProject/TauCetiRoadmap"
 REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
 EXACT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
@@ -60,21 +65,8 @@ def codex_review_args(model, effort):
     return ((["--codex-model", model] if model else [])
             + (["--codex-effort", effort] if effort else []))
 
-# A "review in progress" marker comment de-contends concurrent reviewers without any write access
-# beyond commenting: an independent reviewer may have repo write NOWHERE, but anyone who can review a
-# PR can comment on it. A reviewer posts the marker before spending inference and deletes it when done;
-# the embedded TTL self-clears a crashed reviewer. The marker is scoped to (head) ALONE: the first run
-# to claim a commit reviews it, and any other run — whatever model it would use — yields, so a commit
-# is reviewed exactly once regardless of model (a new push is a fresh head, hence a fresh unit). The
-# marker still records which providers are running, but only for display; it is not part of the
-# de-contention key. Trust is NOT gated on author association, matching the scoreboard merge gate:
-# a forged marker can at worst delay a review by its TTL — no inference runs, no data lands —
-# so honoring anyone's marker is what lets a fleet of non-collaborators coordinate at all.
-COORD_MARKER = "tauceti-review-in-progress"
-COORD_RE = re.compile(r"<!--tauceti-review-in-progress (.*?)-->", re.S)
-COORD_TTL = int(os.environ.get("TAUCETI_REVIEW_INPROGRESS_TTL", "1800"))  # 30 min; > a slow review
-COORD_SETTLE_S = 5.0  # let simultaneously-posted markers propagate before inference starts
-COORD_SETTLE_POLL_S = 0.5
+# Git leases coordinate one review per repository/PR/head, regardless of model.
+COORD_TTL = int(os.environ.get("TAUCETI_REVIEW_CLAIM_TTL", "1800"))
 
 
 def die(msg):
@@ -429,6 +421,8 @@ def fetch_thread_replies(repo, pr):
     r = run(["gh", "api", "--paginate", "--jq", ".[]",
              f"/repos/{repo}/pulls/{pr}/comments?per_page=100"],
             capture=True, quiet=True, allow_fail=True)
+    if r.returncode != 0:
+        return None  # Unavailable history cannot establish that there is no new contest.
     comments = []
     for line in (r.stdout or "").splitlines():
         line = line.strip()
@@ -438,11 +432,13 @@ def fetch_thread_replies(repo, pr):
             except json.JSONDecodeError:
                 continue
     root_rubric = {}
+    root_bodies = {}
     for c in comments:
         if c.get("in_reply_to_id") is None:
             m = re.search(r"tauceti-rubric:([a-z][a-z-]*?)\s*-->", c.get("body", ""))
             if m:
                 root_rubric[c["id"]] = m.group(1)
+                root_bodies[c["id"]] = c.get("body") or ""
     replies = {}
     for c in comments:
         root = c.get("in_reply_to_id")
@@ -454,12 +450,23 @@ def fetch_thread_replies(repo, pr):
             continue  # our own contest answer / a nested root — never a fresh contest
         replies.setdefault(rubric, []).append(
             {"id": c.get("id"), "ts": c.get("created_at", ""), "root_id": root,
-             "by": (c.get("user") or {}).get("login", "author"), "body": body})
+             "by": (c.get("user") or {}).get("login", "author"), "body": body,
+             "root_body": root_bodies.get(root, "")})
     return replies
 
 
 SCOREBOARD_MARKER = "<!--tauceti-scoreboard-->"
 META_RE = re.compile(r"<!--tauceti-meta:v1 (.*?)-->", re.S)
+
+
+def write_review_result(head, changed):
+    """A trusted per-invocation outcome for the driving worker; no API requests."""
+    target = os.environ.get("TAUCETI_REVIEW_RESULT_FILE")
+    if target:
+        path = pathlib.Path(target)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps({"head_sha": head, "changed": changed}))
+        os.replace(tmp, path)
 
 
 def latest_scoreboard(comments):
@@ -485,13 +492,13 @@ def latest_scoreboard(comments):
         key = (c.get("updated_at") or c.get("created_at") or meta.get("ts") or "", index)
         if best is None or key > best[0]:
             best = (key, {"comment_id": c.get("id"), "by": (c.get("user") or {}).get("login"),
-                          "head_sha": meta["head_sha"], "states": meta["states"]})
+                          "head_sha": meta["head_sha"], "states": meta["states"],
+                          **{k: meta[k] for k in ("replies_through", "rubrics_version") if k in meta}})
     return best[1] if best else None
 
 
 def issue_comments(repo, pr):
-    """All issue comments on a PR. Returns None on a fetch FAILURE (distinct from an empty list), so the
-    caller can tell "no markers" from "couldn't look" and not mistake an API blip for a clear field."""
+    """All issue comments on a PR, or None on a fetch failure."""
     r = run(["gh", "api", "--paginate", "--jq", ".[]",
              f"/repos/{repo}/issues/{pr}/comments?per_page=100"],
             capture=True, quiet=True, allow_fail=True)
@@ -508,78 +515,22 @@ def issue_comments(repo, pr):
     return out
 
 
-def covered_providers(comments, head, now, *, exclude_nonce, max_id=None):
-    """Providers advertised by any UNEXPIRED in-progress marker for this EXACT head — posted by a
-    different run (nonce ≠ exclude_nonce). De-contention is on the head alone, so the SET being
-    non-empty is what matters (a commit is reviewed once); the provider names are kept only for the
-    skip message. With max_id set, only count markers whose comment id is lower (the deterministic
-    tiebreak for a simultaneous post: the lowest-id marker wins the head)."""
-    cov = set()
-    for c in comments:
-        m = COORD_RE.search(c.get("body") or "")
-        if not m:
-            continue
-        try:
-            d = json.loads(m.group(1))
-        except json.JSONDecodeError:
-            continue
-        exp = d.get("expires_at")
-        if not isinstance(exp, int) or exp <= now or d.get("nonce") == exclude_nonce:
-            continue
-        marker_head = d.get("head")
-        if not isinstance(marker_head, str) or marker_head != head:  # exact: a new push is a new unit
-            continue
-        cid = c.get("id")
-        if max_id is not None and not (isinstance(cid, int) and cid < max_id):
-            continue
-        cov.update(p for p in (d.get("providers") or []) if isinstance(p, str))
-    return cov
-
-
-def post_marker(repo, pr, head, providers, nonce, submitted_by):
-    """Post a review-in-progress marker for `providers` on `head`; return its comment id (None on
-    failure). Best-effort: an inability to comment (a reviewer with no access) just means no marker."""
-    now = int(time.time())
-    payload = {"schema": f"{COORD_MARKER}/v1", "nonce": nonce, "providers": list(providers),
-               "head": head, "submitted_by": submitted_by or "", "started_at": now,
-               "expires_at": now + COORD_TTL}
-    body = (f"🔍 Review in progress — `{','.join(providers)}` reviewing `{head[:12]}`."
-            f"\n<!--{COORD_MARKER} "
-            f"{json.dumps(payload, separators=(',', ':'))}-->")
-    r = run(["gh", "api", f"/repos/{repo}/issues/{pr}/comments", "-f", f"body={body}", "--jq", ".id"],
-            capture=True, quiet=True, allow_fail=True)
-    if r.returncode != 0:
-        return None
-    out = (r.stdout or "").strip()
-    return int(out) if out.isdigit() else None
-
-
-def delete_marker(repo, comment_id):
-    """Remove a marker by id. Best-effort (a 404 — already gone or expired-and-gc'd — is fine)."""
-    run(["gh", "api", "-X", "DELETE", f"/repos/{repo}/issues/comments/{comment_id}"],
-        quiet=True, capture=True, allow_fail=True)
-
-
-# Markers this process owns and must remove on exit. atexit alone misses signals, so SIGTERM/SIGINT are
-# routed through sys.exit (which DOES run atexit); SIGKILL can't be caught, which is what the TTL backs.
-_ACTIVE_MARKERS = []
+# SIGTERM/SIGINT run atexit cleanup; SIGKILL is covered by the lease TTL.
+_ACTIVE_GIT_CLAIMS = []
 _CLEANUP_INSTALLED = False
 
 
-def _delete_active_markers():
-    while _ACTIVE_MARKERS:
-        repo, cid = _ACTIVE_MARKERS.pop()
-        delete_marker(repo, cid)
+def _release_active_claims():
+    while _ACTIVE_GIT_CLAIMS:
+        _ACTIVE_GIT_CLAIMS.pop().release()
 
 
-def _install_marker_cleanup():
-    """Arm marker deletion on normal exit and on SIGTERM/SIGINT. Idempotent; installed only once we
-    actually own a marker, so a non-coordinating run never changes signal disposition."""
+def _install_claim_cleanup():
     global _CLEANUP_INSTALLED
     if _CLEANUP_INSTALLED:
         return
     _CLEANUP_INSTALLED = True
-    atexit.register(_delete_active_markers)
+    atexit.register(_release_active_claims)
     for sig, code in ((signal.SIGTERM, 143), (signal.SIGINT, 130)):
         try:
             signal.signal(sig, lambda *_a, _c=code: sys.exit(_c))
@@ -587,74 +538,44 @@ def _install_marker_cleanup():
             pass  # not the main thread / unsupported — atexit + TTL still apply
 
 
-def _recheck_lost(repo, pr, head, nonce, cid, *, settle_s=None, poll_s=None,
-                  monotonic=time.monotonic, sleeper=time.sleep):
-    """After posting, return the providers any LOWER-id foreign marker advertises on this head — a
-    non-empty result means a peer claimed the head first and we must yield the whole run. Keep polling
-    for a fixed settlement window EVEN AFTER our own comment becomes visible: GitHub can make a
-    writer's own comment visible before an earlier peer's comment reaches that replica, and stopping
-    at first self-visibility lets both reviewers believe they won. Time is re-read each scan so an
-    expiring lower-id marker isn't honored past its TTL."""
-    settle_s = COORD_SETTLE_S if settle_s is None else max(0.0, settle_s)
-    poll_s = COORD_SETTLE_POLL_S if poll_s is None else max(0.001, poll_s)
-    deadline = monotonic() + settle_s
-    read_failed = False
-    while True:
-        comments = issue_comments(repo, pr)
-        if comments is None:
-            read_failed = True
-        else:
-            lost = covered_providers(comments, head, int(time.time()), exclude_nonce=nonce, max_id=cid)
-            if lost:
-                return lost
-        remaining = deadline - monotonic()
-        if remaining <= 0:
-            break
-        sleeper(min(poll_s, remaining))
-    if read_failed:
-        print("note: couldn't consistently list PR comments while settling the review claim; "
-              "proceeding with our marker (a concurrent duplicate review is possible).", file=sys.stderr)
-    return set()
+def git_claim_for(repo, pr, head, nonce):
+    from tauceti_tools.claims import GitClaim, review_repository
+    claim_repo = review_repository(repo)
+    if not claim_repo:
+        return None, 2
+    claim = GitClaim(claim_repo, f"review/{repo.lower()}/{pr}/{head}",
+                     f"{os.environ.get('TAUCETI_WORKER_ID', 'review')}-{nonce}", COORD_TTL)
+    return claim, claim.acquire()
 
 
-def coordinate(repo, pr, head, avail, submitted_by):
-    """[COOP] de-contend concurrent reviewers via a review-in-progress comment, on the head ALONE: a
-    commit is reviewed once regardless of model. Returns `avail` (this run owns the head and should
-    review it) having posted our own marker and armed its deletion at exit, or [] to skip the whole run
-    and spend nothing because another run already holds the head. A different model is NOT a distinct
-    unit — the first claimer wins — but a new push is a new head, hence a new claim.
+def record_coordination(repo, pr, head, nonce, *, git_held):
+    try:
+        from tauceti_tools.claims import record_review_start
+        record_review_start(repo, pr, head, nonce, git_held=git_held)
+    except Exception:
+        pass  # Local reporting must never prevent a review.
 
-    Not an atomic CAS, so after posting we re-read for a fixed settlement window and yield if any
-    LOWER-id foreign marker is on the head — the lowest-id marker wins, which collapses the
-    simultaneous-post window. A read/post failure (e.g. no comment access) warns and proceeds: a
-    possible duplicate review, never corruption.
+
+def coordinate(repo, pr, head, avail):
+    """Claim this head before inference, or yield to its existing Git lease holder.
+
+    Git outages permit a possible duplicate review rather than stopping autonomous work.
+    Temporary issue comments are neither read nor written for coordination.
     """
     nonce = uuid.uuid4().hex
-    comments = issue_comments(repo, pr)
-    if comments is None:
-        print("note: couldn't list PR comments to check for an in-flight review; proceeding and still "
-              "posting our marker (a concurrent duplicate review is possible).", file=sys.stderr)
-        comments = []
-    cov = covered_providers(comments, head, int(time.time()), exclude_nonce=nonce)
-    if cov:
-        print(f"PR #{pr} @ {head[:12]} is already being reviewed ({','.join(sorted(cov))}) — "
-              f"skipping to avoid duplicate spend.", file=sys.stderr)
+    claim, rc = git_claim_for(repo, pr, head, nonce)
+    if rc == 1:
+        print(f"PR #{pr} @ {head[:12]}: Git claim held by another reviewer — skipping.", file=sys.stderr)
         return []
-    run_set = list(avail)
-    cid = post_marker(repo, pr, head, run_set, nonce, submitted_by)
-    if cid is None:
-        print("note: couldn't post a review-in-progress marker (no comment access?); proceeding "
-              "without de-contention — a concurrent duplicate review is possible.", file=sys.stderr)
-        return run_set
-    lost = _recheck_lost(repo, pr, head, nonce, cid)
-    if lost:
-        print(f"PR #{pr} @ {head[:12]}: lost the post race ({','.join(sorted(lost))} claimed it "
-              f"first) — skipping.", file=sys.stderr)
-        delete_marker(repo, cid)
-        return []
-    _ACTIVE_MARKERS.append((repo, cid))
-    _install_marker_cleanup()
-    return run_set
+    if rc == 0:
+        claim.start_heartbeat()
+        _ACTIVE_GIT_CLAIMS.append(claim)
+        _install_claim_cleanup()
+    else:
+        print("note: Git review claim unavailable; proceeding without coordination "
+              "(a concurrent duplicate review is possible).", file=sys.stderr)
+    record_coordination(repo, pr, head, nonce, git_held=rc == 0)
+    return list(avail)
 
 
 def main():
@@ -748,13 +669,11 @@ def main():
                     help="run the rubrics AND engine pinned at this TauCetiReview commit "
                          "(a cached per-SHA checkout), instead of the floating main")
     ap.add_argument("--no-coordinate", action="store_true",
-                    help="skip the review-in-progress marker. By default a contributing run (one that "
-                         "posts or archives) posts a short-lived marker comment and skips a provider "
-                         "another reviewer is already running on the same head — so a fleet doesn't "
-                         "pay twice for identical work. Pass this to review without touching the PR "
-                         "(e.g. a private read-only pass), at the cost of possible duplicate spend.")
+                    help="skip Git review coordination (possible duplicate spend); shadow runs "
+                         "opt out automatically")
     # Older workers pass this flag. Accept it during rolling upgrades without limiting reviews.
     ap.add_argument("--max-rounds-per-day", type=int, help=argparse.SUPPRESS)
+    ap.add_argument("--conf")
     a = ap.parse_args()
 
     a.kiro_model = (a.kiro_model or "").strip()
@@ -777,8 +696,8 @@ def main():
         if not outbox.is_dir() or not any(p.is_file() for p in outbox.rglob("*")):
             print("tauceti-review --sync-only: outbox empty; nothing to sync")
             return
-        repo_dir = engine_at(a.rubrics_sha) if a.rubrics_sha else resolve_repo_dir(a.repo_dir)
-        data_dir = a.data_dir or str(CACHE_DIR / "data" / "TauCetiData")
+        repo_dir = engine_at(a.rubrics_sha or os.environ.get("TAUCETI_REVIEW_REF")) if (a.rubrics_sha or os.environ.get("TAUCETI_REVIEW_REF")) and not a.repo_dir else resolve_repo_dir(a.repo_dir)
+        data_dir = a.data_dir or str(CACHE_DIR / "data" / os.environ.get("TAUCETI_DATA_REPO", "TauCetiProject/TauCetiData").replace("/", "__"))
         run([sys.executable, str(repo_dir / "runner" / "archive.py"), "sync",
              "--store", str(a.store), "--data-dir", data_dir])
         return
@@ -846,7 +765,7 @@ def main():
         die("--codex-model/--codex-effort require codex in the active reviewer set.")
     print(f"reviewers: {providers}", file=sys.stderr)
 
-    repo_dir = engine_at(a.rubrics_sha) if a.rubrics_sha else resolve_repo_dir(a.repo_dir)
+    repo_dir = engine_at(a.rubrics_sha or os.environ.get("TAUCETI_REVIEW_REF")) if (a.rubrics_sha or os.environ.get("TAUCETI_REVIEW_REF")) and not a.repo_dir else resolve_repo_dir(a.repo_dir)
     print(f"engine + rubrics: {repo_dir}"
           + (f" (pinned @ {a.rubrics_sha[:12]})" if a.rubrics_sha else ""), file=sys.stderr)
 
@@ -867,11 +786,11 @@ def main():
     # contributing run (one that posts or archives): a pure read-only dry run (--no-archive, no --post)
     # touches nothing, and a shadow arm deliberately re-reviews the same diff, so both opt out.
     if (a.post or not a.no_archive) and not a.shadow and not a.no_coordinate:
-        avail = coordinate(a.repo, a.pr, head, avail, a.submitted_by)
+        avail = coordinate(a.repo, a.pr, head, avail)
         if not avail:
             if not a.keep and not a.workdir:
                 shutil.rmtree(work, ignore_errors=True)
-            return
+            return COORDINATED_ELSEWHERE_EXIT
         providers = ",".join(avail)
         print(f"reviewers (after de-contention): {providers}", file=sys.stderr)
 
@@ -967,7 +886,10 @@ def main():
     # blind. This is the local equivalent of CI's reply-trigger flow.
     replies = fetch_thread_replies(a.repo, a.pr)
     replies_path = work / "replies.json"
-    replies_path.write_text(json.dumps(replies))
+    if replies is not None:
+        replies_path.write_text(json.dumps(replies))
+    else:
+        replies_path.unlink(missing_ok=True)
     # Another reviewer's newest scoreboard, whose approvals the engine seeds as stale (♻️) where this
     # store has no verdict. Not for --fresh (start clean), --shadow (scratch) or manual (re-runs all).
     prior_board = None
@@ -979,7 +901,19 @@ def main():
         print("author replies on threads: "
               + ", ".join(f"{k}×{len(v)}" for k, v in replies.items()), file=sys.stderr)
 
-    rub_sha, rub_approx = rubrics_repo_sha(repo_dir)
+    rubric_dir = repo_dir / "rubrics"
+    rubric_repo = os.environ.get("TAUCETI_RUBRICS_REPO", REVIEW_REPO)
+    if os.environ.get("TAUCETI_CONF") and rubric_repo != REVIEW_REPO:
+        ref = os.environ.get("TAUCETI_RUBRICS_REF", "")
+        if not re.fullmatch(r"[0-9a-f]{40}", ref):
+            die("A custom rubric repository requires review.rubrics_ref as a full commit SHA")
+        rubric_checkout = work / "rubric-source"
+        run(["git", "clone", "-q", "--no-checkout", f"https://github.com/{rubric_repo}", str(rubric_checkout)])
+        run(["git", "-C", str(rubric_checkout), "checkout", "--detach", ref])
+        rubric_dir = rubric_checkout / "rubrics"
+        rub_sha, rub_approx = ref, False
+    else:
+        rub_sha, rub_approx = rubrics_repo_sha(repo_dir)
     # By environment rather than a flag, so a --rubrics-sha pin to an engine predating it still runs.
     # Only the engine's environment: an embedding caller's os.environ must not carry it onward.
     sha, dirty = cli_sha()
@@ -987,8 +921,8 @@ def main():
     if policy is None:
         print("tauceti-review: WARNING: merged fork rubric policy could not be verified; "
               "comparing every rubric with upstream main.", file=sys.stderr)
-    drift, published = rubrics_publication(repo_dir / "rubrics", rub_sha,
-                                          (policy or {}).get("targets"))
+    drift, published = (rubrics_publication(rubric_dir, rub_sha, (policy or {}).get("targets"))
+                        if rubric_repo == REVIEW_REPO else (None, None))
     if drift:
         print(f"tauceti-review: WARNING: the rubrics in {repo_dir} differ from {REVIEW_REPO}'s "
               "published main plus the verified fork pins. This review applies them anyway; "
@@ -1008,7 +942,7 @@ def main():
     cmd = [sys.executable, str(repo_dir / "runner" / "review.py"),
            "--repo", a.repo, "--pr", str(a.pr), "--mode", "manual" if a.shadow else a.mode,
            *(["--shadow", "--arm", f"shadow:{a.label}"] if a.shadow else []),
-           "--rubrics-dir", str(repo_dir / "rubrics"), "--tool-cwd", str(work),
+           "--rubrics-dir", str(rubric_dir), "--rubrics-repo", rubric_repo, "--tool-cwd", str(work),
            "--code-path", "code", "--roadmap-path", "roadmap",
            *mathlib_args,
            "--diff-file", str(work / "diff.txt"), "--paths-file", str(work / "paths.z"),
@@ -1050,6 +984,13 @@ def main():
     if not sb.is_file():
         die(f"review step exited cleanly but produced no scoreboard ({sb}); the engine did not run.")
     review_error = not a.shadow and plan.is_file() and json.loads(plan.read_text()).get("review_error", False)
+    if not a.shadow and plan.is_file() and json.loads(plan.read_text()).get("review_changed") is False:
+        print("Review unchanged: already published; selecting other work.", file=sys.stderr)
+        if a.post:
+            write_review_result(head, False)
+        if not a.keep and not a.workdir:
+            shutil.rmtree(work, ignore_errors=True)
+        return 0
     print("\n" + "=" * 72)
     print(sb.read_text())
     threads = sorted((work / "threads").glob("*.md")) if (work / "threads").is_dir() else []
@@ -1073,6 +1014,7 @@ def main():
              *(["--archive-dir", outbox] if outbox else [])],
             env=env)
         print("posted.", file=sys.stderr)
+        write_review_result(head, True)
     else:
         print("dry run — nothing posted. Re-run with --post to publish this review.",
               file=sys.stderr)
@@ -1081,8 +1023,8 @@ def main():
     # records in <store>/outbox, and the next run (or `archive.py sync` / `--sync-only`) lands them.
     # --no-sync skips this push: the records stay in the outbox for a trusted caller (the worker
     # host) to drain with --sync-only, which is how a network-restricted bubble publishes.
-    if outbox and not a.no_sync and pathlib.Path(outbox).is_dir():
-        data_dir = a.data_dir or str(CACHE_DIR / "data" / "TauCetiData")
+    if outbox and not a.no_sync and pathlib.Path(outbox).is_dir() and os.environ.get("TAUCETI_DATA_REPO", "TauCetiProject/TauCetiData"):
+        data_dir = a.data_dir or str(CACHE_DIR / "data" / os.environ.get("TAUCETI_DATA_REPO", "TauCetiProject/TauCetiData").replace("/", "__"))
         r = run([sys.executable, str(repo_dir / "runner" / "archive.py"), "sync",
                  "--store", str(outbox_store), "--data-dir", data_dir], allow_fail=True)
         if r.returncode != 0:
@@ -1099,4 +1041,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

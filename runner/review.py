@@ -11,6 +11,10 @@ rubrics whose last round was not `approve`. The workflow commits the store after
 
 import argparse, datetime, hashlib, json, os, pathlib, random, re, secrets, sys, time
 
+if os.environ.get("TAUCETI_CONF") or any(arg == "--conf" or arg.startswith("--conf=") for arg in sys.argv[1:]):
+    from tauceti_tools.project import bootstrap
+    bootstrap()
+
 import archive
 from dataclasses import dataclass, field
 
@@ -33,6 +37,7 @@ from render import meta_block, render_contest_reply, render_scoreboard, render_t
 # not blocked yet). The non-blocking style angles follow in their README order.
 DEFAULT_RUBRICS = ["correctness", "reuse", "scope", "attribution", "api-design",
                    "generality", "placement", "naming", "documentation", "proof-quality"]
+DEFAULT_RUBRICS = json.loads(os.environ.get("TAUCETI_RUBRICS", "[]")) or DEFAULT_RUBRICS
 
 # Fields that must never be written to a record this runner persists. BOTH sinks are public: the
 # archive record goes to TauCetiData, and `--store` is a checkout of this repo's `reviews` branch
@@ -240,6 +245,37 @@ def thread_action_rubrics(candidates, ran, state_map, head):
         if rubric in ran or (adverse and (missing_root or cf.get("pending_thread_run_id"))):
             out.append(rubric)
     return out
+
+
+def can_reuse_completed_review(board, head, candidates, replies, pr_state):
+    """Published completion survives an empty worker store; local repairs still run."""
+    if (not board or board.get("mode") == "init" or board.get("head_sha") != head
+            or not candidates or not isinstance(replies, dict)):
+        return False
+    states = board.get("states") or {}
+    current = [states.get(r) for r in candidates]
+    allowed = {"green", "blocking_request", "blocking_block"}
+    if any(s in ("blocking_request", "blocking_block") for s in current):
+        allowed.add("stale")  # Approvals deferred while an adverse finding remains.
+    if "blocking_block" in current:
+        allowed.add("absent")  # A block halts the remaining rubric sweep.
+    if not all(isinstance(s, str) and s in allowed for s in current):
+        return False
+    for rubric_replies in replies.values():
+        for reply in rubric_replies:
+            if not isinstance(reply.get("id"), int):
+                return False
+    # A completed review at the new head supersedes this worker's older case
+    # files. Current-head findings and interrupted publication still need work.
+    state_map = {r: cf for r, cf in (pr_state.get("state") or {}).items()
+                 if cf.get("reviewed_sha") == head or cf.get("approved_sha") == head}
+    if (pr_state.get("pending_publication_head_sha") == head
+            or (state_map and pr_state.get("scoreboard_comment_id")
+                and not pr_state.get("published_head_sha"))
+            or any(is_unresolved(state_of(state_map.get(r), head)) for r in candidates)
+            or thread_action_rubrics(candidates, [], state_map, head)):
+        return False
+    return True
 
 
 def render_thread_plan(candidates, ran, state_map, head, prov, paths, threads_dir,
@@ -587,7 +623,7 @@ def merge_decision(a, states, candidates, all_green, head):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo", default="TauCetiProject/TauCeti")
+    ap.add_argument("--repo", default=os.environ.get("TAUCETI_REPO", "TauCetiProject/TauCeti"))
     ap.add_argument("--pr", required=True)
     ap.add_argument("--rubrics", default=",".join(DEFAULT_RUBRICS))
     ap.add_argument("--rubrics-dir", required=True)
@@ -618,7 +654,7 @@ def main():
     ap.add_argument("--merge-base-sha", default="",
                     help="merge base of base and head — the actual left side of the reviewed "
                          "three-dot diff (runner/pr_diff.py). Recorded as provenance")
-    ap.add_argument("--rubrics-repo", default="TauCetiProject/TauCetiReview",
+    ap.add_argument("--rubrics-repo", default=os.environ.get("TAUCETI_RUBRICS_REPO", "TauCetiProject/TauCetiReview"),
                     help="owner/name the pinned rubric links point into")
     ap.add_argument("--rubrics-sha", default="",
                     help="git commit SHA of the rubrics+engine checkout, for pinned rubric links "
@@ -650,11 +686,11 @@ def main():
     ap.add_argument("--auto-merge", action="store_true",
                     help="compute a merge decision: mergeable iff every rubric approves on the "
                          "current commit and the PR touches only --merge-path-prefix")
-    ap.add_argument("--merge-path-prefix", default="TauCeti/",
+    ap.add_argument("--merge-path-prefix", default=os.environ.get("TAUCETI_LEAN_ROOT", "TauCeti").replace(".", "/") + "/",
                     help="auto-merge only PRs whose every changed path is under this prefix; "
                          "anything else (infra) is left for human merge")
     ap.add_argument("--merge-allow-file", action="append",
-                    default=["TauCeti.lean", "lake-manifest.json", "lean-toolchain"],
+                    default=[os.environ.get("TAUCETI_LEAN_ROOT", "TauCeti").replace(".", "/") + ".lean", "lake-manifest.json", "lean-toolchain"],
                     help="extra exact paths (besides --merge-path-prefix) an auto-mergeable PR "
                          "may touch; defaults to the root aggregator TauCeti.lean (so a PR can make "
                          "a new module reachable from the root) and the two machine-validated Lake "
@@ -734,6 +770,7 @@ def main():
     ap.add_argument("--post-plan-file", default="",
                     help="write the post plan (scoreboard + thread upsert/close actions) here")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--conf")
     a = ap.parse_args()
     try:
         a.kiro_model = exact_kiro_model(a.kiro_model)
@@ -840,13 +877,55 @@ def main():
         print(f"[carry] {', '.join(carried)}: approvals carried to {head[:9]} — patch unchanged "
               f"since {origin[:9]}, nothing to re-review.")
 
+    # The CLI already fetched this selected PR's scoreboard and thread replies.
+    # Missing local case files do not reopen a completed review. An unavailable
+    # replies file keeps the existing blind-review path rather than assuming no contest.
+    author_replies = None
+    if a.replies_json and pathlib.Path(a.replies_json).exists():
+        author_replies = json.loads(pathlib.Path(a.replies_json).read_text())
+    prior_board = None
+    if a.prior_scoreboard_json and pathlib.Path(a.prior_scoreboard_json).exists():
+        prior_board = json.loads(pathlib.Path(a.prior_scoreboard_json).read_text())
+    handoff_board = (prior_board if a.mode == "commit" and not a.shadow
+                     and can_reuse_completed_review(prior_board, head, candidates, author_replies,
+                                                    pr_state) else None)
+    published_states = (handoff_board or {}).get("states", {})
+    through = (handoff_board or {}).get("replies_through")
+    through = through if isinstance(through, int) else 0
+    new_contest = handoff_board and any(
+        reply["id"] > through for rubric in candidates for reply in author_replies.get(rubric, []))
+    if handoff_board and not new_contest:
+        # The normal CLI expects a local scoreboard artifact before inspecting
+        # the existing unchanged post-plan contract. This body is never posted.
+        if a.scoreboard_file:
+            pathlib.Path(a.scoreboard_file).write_text(f"Review already completed for `{head}`.\n")
+        if a.post_plan_file:
+            pathlib.Path(a.post_plan_file).write_text(json.dumps({
+                "head_sha": head, "review_changed": False, "threads": []}))
+        print("UNCHANGED: published review already completed at this head; no new round or publication.")
+        return
+
+    def effective_state(rubric):
+        cf = state_map.get(rubric)
+        return state_of(cf, head) if (cf or {}).get("verdict") else published_states.get(rubric, "absent")
+
+    if handoff_board:
+        # During a real contest, retain the other published decisions for
+        # scheduling/rendering. Do not invent local case files or model runs.
+        prov["reused_scoreboard_comment_id"] = handoff_board.get("comment_id")
+        # Older-head findings/approvals are superseded by this completed board.
+        # Keep their archived rounds, but do not use them to adjudicate a new
+        # contest or override the current published decisions.
+        state_map = {r: cf for r, cf in state_map.items()
+                     if cf.get("reviewed_sha") == head or cf.get("approved_sha") == head}
+        pr_state["state"] = state_map
+
     # A reviewer taking over a PR another reviewer has been reviewing has no case files for it. Seed
     # that reviewer's approvals as stale, so this round re-runs only the blocking rubrics and sweeps
     # the seeded ones once the PR is otherwise clean, exactly as if it had made them itself.
-    if (a.mode in ("commit", "reply") and not a.shadow and a.prior_scoreboard_json
+    if (a.mode in ("commit", "reply") and not a.shadow and not handoff_board and a.prior_scoreboard_json
             and pathlib.Path(a.prior_scoreboard_json).exists()):
-        board = json.loads(pathlib.Path(a.prior_scoreboard_json).read_text())
-        seeded = seed_stale_approvals(state_map, board, candidates)
+        seeded = seed_stale_approvals(state_map, prior_board, candidates)
         if seeded:
             prov["seeded_rubrics"] = ",".join(seeded)
             src = state_map[seeded[0]]["imported_from"]
@@ -856,16 +935,18 @@ def main():
     # Fold author replies gathered from the PR's rubric threads into each rubric's case file, so a
     # re-run sees the author's contest (untrusted argument) and re-adjudicates against it. Replaces
     # rather than appends, so it always reflects the current thread state (idempotent across runs).
-    if a.replies_json and pathlib.Path(a.replies_json).exists():
-        for rubric, reps in json.loads(pathlib.Path(a.replies_json).read_text()).items():
+    if isinstance(author_replies, dict):
+        for rubric, reps in author_replies.items():
             if reps and rubric in candidates:
                 cf = state_map.setdefault(rubric, {})
                 cf["author_replies"] = reps
+                if handoff_board:
+                    cf["last_reply_seen"] = max(cf.get("last_reply_seen") or 0, through)
                 # Hydrate the thread root id from GitHub (authoritative) when the local store does not
                 # know it, so a contest answer can ALWAYS be posted in-thread — otherwise a fresh or
                 # cross-machine store would queue+watermark the contest but skip the reply, swallowing
                 # the answer. Only fills a missing id; never overwrites a known one.
-                root_id = next((r.get("root_id") for r in reps if r.get("root_id")), None)
+                root_id = max(reps, key=lambda r: r.get("id") or 0).get("root_id")
                 if root_id and not (cf.get("thread") or {}).get("comment_id"):
                     cf["thread"] = {**(cf.get("thread") or {}), "comment_id": root_id}
 
@@ -884,7 +965,7 @@ def main():
         (outdir / "scoreboard.md").write_text(sb)
         if a.post_plan_file:
             pathlib.Path(a.post_plan_file).write_text(json.dumps(
-                {"head_sha": head, "round": round_num,
+                {"head_sha": head, "round": round_num, "in_progress": True,
                  "scoreboard_comment_id": pr_state.get("scoreboard_comment_id"),
                  "scoreboard_body": str(sb_path), "threads": []}, indent=2))
         print("[init] wrote in-progress scoreboard + scoreboard-only post plan.")
@@ -962,7 +1043,9 @@ def main():
         new input. This is what stops a contest at a stable head from also re-running the OTHER
         blocking rubrics (they were already judged here); only a fresh contest re-opens a rubric."""
         cf = state_map.get(r)
-        s = state_of(cf, head)
+        if r in published_states and not (cf or {}).get("verdict"):
+            return False  # Already judged at this head; only a new contest reopens it.
+        s = effective_state(r)
         if not is_blocking(s):
             return False
         return s in ("absent", "error") or (cf or {}).get("reviewed_sha") != head
@@ -1046,9 +1129,9 @@ def main():
     # clears the last blocker finalizes toward merge the same way. A fresh `block` halts this
     # phase just like phase 1.
     if a.mode in ("commit", "manual", "reply") and not stopped and not halted:
-        while not any(is_unresolved(state_of(state_map.get(r), head)) for r in candidates):
+        while not any(is_unresolved(effective_state(r)) for r in candidates):
             todo = [r for r in candidates
-                    if state_of(state_map.get(r), head) in ("absent", "stale")]
+                    if effective_state(r) in ("absent", "stale")]
             if not todo:
                 break
             for rubric in todo:
@@ -1065,11 +1148,19 @@ def main():
                 break
 
     spent_today, ran, run_results = ctx.spent_today, ctx.ran, ctx.run_results
-    states = {r: state_of(state_map.get(r), head) for r in candidates}
+    states = {r: effective_state(r) for r in candidates}
     overall = overall_label(list(states.values()), stopped)
     # Every blocking rubric green on this head (fresh, not stale). Drives both the auto-merge gate
     # and the budget signal below.
     all_green = bool(candidates) and all(states[r] == "green" for r in candidates)
+    previous = (pr_state.get("rounds") or [{}])[-1]
+    unchanged = (a.mode == "commit" and not a.shadow and not (ran or carried or had_contest)
+                 and pr_state.get("published_head_sha") == head
+                 and pr_state.get("pending_publication_head_sha") != head
+                 and not thread_action_rubrics(candidates, [], state_map, head)
+                 and all(previous.get(k) == v for k, v in {
+                     "head_sha": head, "states": states, "patch_digest": digest,
+                     "rubrics_version": rubrics_version}.items()))
     # A commit round that re-ran ONLY contested-but-clean rubrics (no blocker, no Phase-2 sweep) is a
     # reply round, not a full review pass: an author's back-and-forth must not burn the review budget
     # (the engine's auto-close signal) nor the worker's review-round budget. `full_rounds` excludes
@@ -1103,7 +1194,7 @@ def main():
 
     # Emit the scoreboard body, per-rubric thread bodies, and a post plan for the trusted step.
     scoreboard_md = render_scoreboard(candidates, state_map, head, overall, budget_note, cost_line,
-                                      prov=prov, runs=run_results)
+                                      prov=prov, runs=run_results, published_board=handoff_board)
     (outdir / "scoreboard.md").write_text(scoreboard_md)
     sb_path = pathlib.Path(a.scoreboard_file) if a.scoreboard_file else (outdir / "scoreboard.md")
     if a.scoreboard_file:
@@ -1126,7 +1217,7 @@ def main():
             led.persist()
         return
     threads_dir = pathlib.Path(a.threads_dir) if a.threads_dir else (outdir / "threads")
-    plan = {"head_sha": head, "round": round_num,
+    plan = {"head_sha": head, "round": round_num, "review_changed": not unchanged,
             "review_error": any(states[r] == "error" for r in ran),
             "scoreboard_comment_id": pr_state.get("scoreboard_comment_id"),
             "scoreboard_body": str(sb_path),
@@ -1162,6 +1253,10 @@ def main():
              "head_sha": head}))
         print(f"[budget] full_rounds {full_rounds}/{a.review_budget} (round {round_num}), "
               f"all_green={all_green}, stopped={bool(stopped)}, spent={budget_spent}")
+
+    if unchanged:
+        print("\nUNCHANGED: this head's review is already published; no new round or publication.")
+        return
 
     # A process-restart repair publishes already-persisted findings and the scoreboard but records
     # no review round: it called no model, spent nothing, and must not consume either review cap.
