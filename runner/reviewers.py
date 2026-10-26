@@ -507,6 +507,10 @@ def codex_model_unavailable(res):
 
 _CODEX_EFFORT_ENV = "TAUCETI_INTERNAL_CODEX_REVIEW_EFFORT"
 
+# inherit=none also removes PATH from model-run commands. Supply only standard
+# tool locations, never the parent's environment or credential-bearing values.
+CODEX_TOOL_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
+
 
 def run_codex(prompt, cwd, model, env):
     # The public CLI threads an explicit review effort through a private
@@ -523,7 +527,8 @@ def run_codex(prompt, cwd, model, env):
     # codex to read the prompt from stdin; putting a large rendered review in argv can exceed the
     # OS argument-size limit before codex starts.
     cmd = (["codex", "exec", "--json", "-s", "read-only", "--skip-git-repo-check",
-            "-c", "shell_environment_policy.inherit=none"]
+            "-c", "shell_environment_policy.inherit=none",
+            "-c", f'shell_environment_policy.set.PATH="{CODEX_TOOL_PATH}"']
            + (["-m", model] if model else [])
            + (["-c", f'model_reasoning_effort="{effort}"'] if effort else [])
            + ["-"])
@@ -533,6 +538,8 @@ def run_codex(prompt, cwd, model, env):
         out["reasoning_effort"] = effort
     text, usage, thread, events, errors = "", None, None, [], []
     fail_payload = err_payload = None  # turn.failed (authoritative) and first `error` event (fallback)
+    tool_completed = tool_failed = 0
+    tool_unavailable = False
     for line in r.stdout.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -543,6 +550,21 @@ def run_codex(prompt, cwd, model, env):
             continue
         t = ev.get("type")
         events.append(t)
+        item = ev.get("item") or {}
+        if t == "item.completed" and item.get("type") == "command_execution":
+            tool_completed += 1
+            if item.get("exit_code") not in (None, 0):
+                tool_failed += 1
+            # grep's no-match exit is normal. A missing command or a sandbox
+            # startup failure is an inspection outage, never a green review.
+            output = item.get("aggregated_output") or ""
+            if (item.get("exit_code") == 127 or
+                    (item.get("status") == "failed" and any(message in output for message in (
+                        "sandbox-exec: sandbox_apply:",
+                        "Failed to create unified exec process",
+                        "error running landlock:",
+                    )))):
+                tool_unavailable = True
         if t == "thread.started":
             thread = ev.get("thread_id")
         elif t == "item.completed" and ev.get("item", {}).get("type") == "agent_message":
@@ -559,6 +581,11 @@ def run_codex(prompt, cwd, model, env):
             if err_payload is None and isinstance(ev.get("message"), str):
                 err_payload = ev["message"]
     out.update(text=text, usage=usage, session_id=thread)
+    out["tool_trace_meta"] = {"command_completed": tool_completed,
+                              "command_failed": tool_failed,
+                              "inspection_unavailable": tool_unavailable}
+    if tool_unavailable:
+        out.update(returncode=1, text="", error_message="reviewer inspection tools unavailable")
     # The terminal failure carries a JSON blob (serialized as a STRING field) with an HTTP `status`,
     # error `type`, and human `message`. Parse it defensively so a caller can classify the failure from
     # structured fields, not by regex-scanning escaped transcript text: codex may hand a string/list
