@@ -6,7 +6,10 @@ import json, os, pathlib, re, shutil, sqlite3, subprocess, sys, tempfile, time
 from contextlib import closing
 from urllib.parse import quote
 
-from pricing import OPENROUTER_MODELS, rates
+if __package__:
+    from .pricing import OPENROUTER_MODELS, rates
+else:
+    from pricing import OPENROUTER_MODELS, rates
 
 
 # A pi reviewer's tools: read + grep + ls only — never bash/edit/write. This keeps the review
@@ -191,6 +194,10 @@ def reviewer_env(provider, keys, subscription=False):
         codex_home = os.path.join(home, ".codex")
         os.makedirs(codex_home, exist_ok=True)  # codex requires CODEX_HOME to already exist
         env["CODEX_HOME"] = codex_home
+        # The sandbox launcher needs writable bookkeeping before enforcing the tool's
+        # read-only policy. Do not depend on a host-global /tmp inside another sandbox.
+        env["TMPDIR"] = os.path.join(home, "tmp")
+        os.mkdir(env["TMPDIR"], mode=0o700)
         if subscription:
             # Seed only the ChatGPT login; no personal AGENTS.md / config.toml.
             source_home = os.path.abspath(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
@@ -347,7 +354,7 @@ def _tool_trace(stream_lines, root):
     Returns `(trace, meta, result_event)`. Events are consumed as they are parsed and only the
     terminal result is retained, so a long review does not sit in memory twice."""
     trace, pending, result = [], {}, None
-    total = malformed = 0
+    total = malformed = successful = 0
     for line in stream_lines:
         line = line.strip()
         if not line.startswith("{"):
@@ -373,12 +380,12 @@ def _tool_trace(stream_lines, root):
                 if block.get("type") != "tool_use":
                     continue
                 total += 1
-                if len(trace) >= _MAX_TOOL_TRACE:
-                    continue
                 name = str(block.get("name") or "?")[:40]
                 target = _trace_target(name, block.get("input"), root)
-                trace.append({"tool": name, "target": target} if target else {"tool": name})
-                pending[block.get("id")] = trace[-1]
+                entry = {"tool": name, "target": target} if target else {"tool": name}
+                if len(trace) < _MAX_TOOL_TRACE:
+                    trace.append(entry)
+                pending[block.get("id")] = entry
         elif kind == "user":
             # The paired outcome, and nothing else from this event: a tool_result's `content` is the
             # file the reviewer just read.
@@ -388,7 +395,11 @@ def _tool_trace(stream_lines, root):
                 entry = pending.pop(block.get("tool_use_id"), None)
                 if entry is not None:
                     entry["ok"] = not block.get("is_error")
-    meta = {"total_calls": total, "trace_truncated": total > len(trace)}
+                    if (entry["ok"] and entry["tool"] in _REVIEW_TOOLS
+                            and entry.get("target") not in (_OUTSIDE, _MISSING)):
+                        successful += 1
+    meta = {"total_calls": total, "successful_calls": successful,
+            "trace_truncated": total > len(trace)}
     if malformed:
         meta["malformed_events"] = malformed
     return trace, meta, result
@@ -507,16 +518,67 @@ def codex_model_unavailable(res):
 
 _CODEX_EFFORT_ENV = "TAUCETI_INTERNAL_CODEX_REVIEW_EFFORT"
 
-# inherit=none also removes PATH from model-run commands. Supply only standard
-# tool locations, never the parent's environment or credential-bearing values.
-CODEX_TOOL_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
+
+_SANDBOX_FAILURE = re.compile(
+    r"Sandbox\((?:LandlockRestrict|Seccomp|Seatbelt)\)"
+    r"|(?:sandbox|read.only (?:shell|command|tool)|command (?:runner|sandbox))"
+    r"[^.\n]{0,100}(?:failed|unavailable|could not|couldn't|prevented)"
+    r"|(?:failed|unable) to (?:start|initialize|initialise|create|set up)[^.\n]{0,60}sandbox",
+    re.I,
+)
+_INSPECTION_FAILURE = re.compile(
+    r"(?:inspection|repository searches|filesystem access|source access)"
+    r"[^.\n]{0,100}(?:unavailable|incomplete|could not|couldn't|prevented|failed)"
+    r"|\b(?:Mathlib|dependency sources?)(?: sources?| checkout)?\s+"
+    r"(?:(?:was|is|were|are)\s+)?(?:not in|not present in|missing from) (?:the|its|this) checkout\b"
+    r"|\b(?:Mathlib (?:sources?|checkout)|dependency sources?)\s+"
+    r"(?:(?:was|is|were|are)\s+)?(?:missing|absent|unavailable)\b",
+    re.I,
+)
+
+
+def inspection_failure(res, verdict=None):
+    """Fail closed on broken inspection, even when the CLI and model claim success.
+
+    Explicit tool failures are authoritative; the model cannot override them with an approval. A
+    self-reported inspection gap in the final summary is an additional reason to withhold
+    publication, never evidence that can grant approval. Tool counts alone are not failures:
+    the prompt already contains the diff, which may provide all the source a rubric needs.
+    Do not scan quoted findings or diffs.
+    """
+    if res.get("inspection_error"):
+        return res["inspection_error"]
+    if _SANDBOX_FAILURE.search(res.get("raw_stderr") or ""):
+        return "sandbox_failed"
+    if verdict is not None:
+        summary = verdict.get("summary") or ""
+        if _SANDBOX_FAILURE.search(summary):
+            return "sandbox_failed"
+        if _INSPECTION_FAILURE.search(summary):
+            return "inspection_incomplete"
+    return None
+
+
+def codex_shell_environment_args(env):
+    """Keep tools credential-free while retaining the launcher's runtime requirements.
+
+    Codex launches the Linux sandbox helper with the shell environment. inherit=none
+    alone also deletes PATH there, forcing the bundled bwrap even when a working system
+    installation exists. TMPDIR is a private per-attempt directory created by reviewer_env,
+    so bookkeeping also works when the caller's /tmp is read-only. Neither grants the
+    model write access: the selected read-only sandbox policy still applies to its tools.
+    """
+    args = ["-c", "shell_environment_policy.inherit=none"]
+    for key in ("PATH", "TMPDIR"):
+        if key in env:
+            args += ["-c", f"shell_environment_policy.set.{key}="
+                     + json.dumps(env[key], ensure_ascii=False)]
+    return args
 
 
 def run_codex(prompt, cwd, model, env):
-    # The public CLI threads an explicit review effort through a private
-    # runner-only environment slot. Remove it before spawning Codex so the
-    # authoritative control is visible in argv and cannot be inherited as
-    # ambient configuration by any tool the reviewer launches.
+    # Keep the explicit effort in argv and provenance, not in the environment
+    # inherited by Codex or any command it launches.
     env = dict(env)
     effort = env.pop(_CODEX_EFFORT_ENV, None)
     # Authenticate into this invocation's isolated CODEX_HOME so the credential is not shared.
@@ -526,9 +588,8 @@ def run_codex(prompt, cwd, model, env):
     # inherit=none: codex's model-run shell commands get a clean env, not codex's own. `-` tells
     # codex to read the prompt from stdin; putting a large rendered review in argv can exceed the
     # OS argument-size limit before codex starts.
-    cmd = (["codex", "exec", "--json", "-s", "read-only", "--skip-git-repo-check",
-            "-c", "shell_environment_policy.inherit=none",
-            "-c", f'shell_environment_policy.set.PATH="{CODEX_TOOL_PATH}"']
+    cmd = (["codex", "exec", "--json", "-s", "read-only", "--skip-git-repo-check"]
+           + codex_shell_environment_args(env)
            + (["-m", model] if model else [])
            + (["-c", f'model_reasoning_effort="{effort}"'] if effort else [])
            + ["-"])
@@ -538,8 +599,8 @@ def run_codex(prompt, cwd, model, env):
         out["reasoning_effort"] = effort
     text, usage, thread, events, errors = "", None, None, [], []
     fail_payload = err_payload = None  # turn.failed (authoritative) and first `error` event (fallback)
-    tool_completed = tool_failed = 0
-    tool_unavailable = False
+    trace, total, successful = [], 0, 0
+    tool_failed = 0
     for line in r.stdout.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -550,25 +611,35 @@ def run_codex(prompt, cwd, model, env):
             continue
         t = ev.get("type")
         events.append(t)
-        item = ev.get("item") or {}
-        if t == "item.completed" and item.get("type") == "command_execution":
-            tool_completed += 1
-            if item.get("exit_code") not in (None, 0):
-                tool_failed += 1
-            # grep's no-match exit is normal. A missing command or a sandbox
-            # startup failure is an inspection outage, never a green review.
-            output = item.get("aggregated_output") or ""
-            if (item.get("exit_code") == 127 or
-                    (item.get("status") == "failed" and any(message in output for message in (
-                        "sandbox-exec: sandbox_apply:",
-                        "Failed to create unified exec process",
-                        "error running landlock:",
-                    )))):
-                tool_unavailable = True
         if t == "thread.started":
             thread = ev.get("thread_id")
         elif t == "item.completed" and ev.get("item", {}).get("type") == "agent_message":
             text = ev["item"].get("text", "")
+        elif t == "item.completed" and ev.get("item", {}).get("type") == "command_execution":
+            item = ev["item"]
+            total += 1
+            ok = item.get("exit_code") == 0 and item.get("status") == "completed"
+            successful += int(ok)
+            if len(trace) < _MAX_TOOL_TRACE:
+                trace.append({"tool": "command_execution", "ok": ok})
+            # Inspect the diagnostic in memory only. Commands and their output may contain
+            # private source or credentials; only the closed-vocabulary signal is persisted.
+            if item.get("exit_code") not in (None, 0):
+                tool_failed += 1
+            output = item.get("aggregated_output")
+            output = output if isinstance(output, str) else ""
+            if not ok and (_SANDBOX_FAILURE.search(output) or
+                           (item.get("status") == "failed" and any(message in output for message in (
+                               "sandbox-exec: sandbox_apply:",
+                               "Failed to create unified exec process",
+                               "error running landlock:",
+                           )))):
+                out["inspection_error"] = "sandbox_failed"
+            elif item.get("exit_code") == 127:
+                # Preserve the fork's missing-command guard. Feed the shared
+                # abort path so it stops without retrying or publishing a plan;
+                # keep the actual CLI exit code and response as provenance.
+                out.setdefault("inspection_error", "inspection_incomplete")
         elif t == "turn.completed":
             usage = ev.get("usage")
         elif t == "turn.failed":  # authoritative terminal failure — its payload carries the API status
@@ -581,11 +652,12 @@ def run_codex(prompt, cwd, model, env):
             if err_payload is None and isinstance(ev.get("message"), str):
                 err_payload = ev["message"]
     out.update(text=text, usage=usage, session_id=thread)
-    out["tool_trace_meta"] = {"command_completed": tool_completed,
-                              "command_failed": tool_failed,
-                              "inspection_unavailable": tool_unavailable}
-    if tool_unavailable:
-        out.update(returncode=1, text="", error_message="reviewer inspection tools unavailable")
+    out.update(tool_trace=trace, tool_trace_meta={
+        "total_calls": total, "successful_calls": successful,
+        "trace_truncated": total > len(trace),
+        # Keep the fork's existing outcome counters alongside upstream's trace.
+        "command_completed": total, "command_failed": tool_failed,
+        "inspection_unavailable": bool(out.get("inspection_error"))})
     # The terminal failure carries a JSON blob (serialized as a STRING field) with an HTTP `status`,
     # error `type`, and human `message`. Parse it defensively so a caller can classify the failure from
     # structured fields, not by regex-scanning escaped transcript text: codex may hand a string/list
